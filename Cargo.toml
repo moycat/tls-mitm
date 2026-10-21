@@ -1,0 +1,29 @@
+[package]
+name = "tls-mitm"
+version = "0.1.0"
+edition = "2021"
+description = "SNI-based TLS test proxy with optional DNS redirection and PCAP streaming"
+license = "MIT"
+exclude = [
+    "/certs/**",
+    "/config*.local.toml",
+    "/.env*",
+    "**/*.pcap",
+    "**/*.pcapng",
+]
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3.34"
+libc = "0.2.189"
+ring = "0.17.14"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+toml = "0.8.23"
+tempfile = "3.27.0"
+webpki-roots = "1.0.9"
+

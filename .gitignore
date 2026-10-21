@@ -1,0 +1,28 @@
+/target/
+*.pcap
+*.pcapng
+
+# Local OS and editor files.
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local settings and credentials; keep the documented test CA fixture.
+.env
+.env.*
+!.env.example
+config.toml
+config.local.toml
+config.*.local.toml
+*.crt
+*.crt.pem
+*.key
+*.key.pem
+*.p12
+*.pfx
+
+# Ship only the example fixtures; keep user-provided configs & CAs private.
+!example/config.toml
+!example/certs/test.crt.pem
+!example/certs/test.key.pem

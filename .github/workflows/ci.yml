@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    env:
+      RUST_VERSION: "1.99.1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore Rust toolchain
+        id: rustup-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.rustup/toolchains/${{ env.RUST_VERSION }}-*
+          key: rustup-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-clippy-rustfmt
+
+      - name: Install Rust toolchain
+        if: steps.rustup-cache.outputs.cache-hit != 'true'
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+
+      - name: Select Rust toolchain
+        run: rustup default "$RUST_VERSION"
+
+      - name: Restore Cargo dependencies and build outputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: "false"
+          cache-targets: "true"
+
+      - name: Check required tools
+        run: |
+          rustc --version
+          cargo --version
+          openssl version
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets and features
+        run: cargo clippy --offline --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --offline --locked
+
+      - name: Build release binary
+        run: cargo build --release --offline --locked
+
+      - name: Check release binary
+        run: target/release/tls-mitm --help
