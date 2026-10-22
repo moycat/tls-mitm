@@ -3,6 +3,7 @@
 //! It deliberately uses the configured upstream resolver instead of the host's
 //! resolver, since the latter may itself have been pointed at this service.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -15,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
 const MAX_MESSAGE: usize = u16::MAX as usize;
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,9 +82,9 @@ async fn serve_udp(socket: Arc<UdpSocket>, config: Arc<DnsConfig>) -> Result<()>
         let config = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Some(reply) = handle_query(&query, &config, Transport::Udp).await {
+            if let Some(reply) = handle_query(&query, &config, Transport::Udp, peer).await {
                 if let Err(error) = socket.send_to(&reply, peer).await {
-                    eprintln!("DNS UDP reply to {peer} failed: {error}");
+                    warn!(%peer, %error, "failed to send DNS UDP reply");
                 }
             }
         });
@@ -94,17 +96,22 @@ async fn serve_tcp(listener: TcpListener, config: Arc<DnsConfig>) -> Result<()> 
     loop {
         let permit = limit.clone().acquire_owned().await?;
         let (stream, peer) = listener.accept().await?;
+        debug!(%peer, "accepted DNS TCP client");
         let config = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_tcp_client(stream, &config).await {
-                eprintln!("DNS TCP client {peer} failed: {error:#}");
+            if let Err(error) = handle_tcp_client(stream, &config, peer).await {
+                warn!(%peer, error = %format_args!("{error:#}"), "DNS TCP client failed");
             }
         });
     }
 }
 
-async fn handle_tcp_client(mut stream: TcpStream, config: &DnsConfig) -> Result<()> {
+async fn handle_tcp_client(
+    mut stream: TcpStream,
+    config: &DnsConfig,
+    peer: SocketAddr,
+) -> Result<()> {
     loop {
         let mut length = [0u8; 2];
         match timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut length)).await {
@@ -121,7 +128,7 @@ async fn handle_tcp_client(mut stream: TcpStream, config: &DnsConfig) -> Result<
         timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut query))
             .await
             .context("DNS TCP query timed out")??;
-        if let Some(reply) = handle_query(&query, config, Transport::Tcp).await {
+        if let Some(reply) = handle_query(&query, config, Transport::Tcp, peer).await {
             let length = (reply.len() as u16).to_be_bytes();
             timeout(DNS_TIMEOUT, async {
                 stream.write_all(&length).await?;
@@ -139,18 +146,86 @@ enum Transport {
     Tcp,
 }
 
-async fn handle_query(query: &[u8], config: &DnsConfig, transport: Transport) -> Option<Vec<u8>> {
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+async fn handle_query(
+    query: &[u8],
+    config: &DnsConfig,
+    transport: Transport,
+    peer: SocketAddr,
+) -> Option<Vec<u8>> {
     match classify_query(query, config) {
         QueryAction::Ignore => None,
         QueryAction::Reply(reply) => Some(reply),
+        QueryAction::Hijack {
+            reply,
+            question,
+            address,
+        } => {
+            match address {
+                Some(address) => info!(
+                    client = %peer,
+                    transport = transport.as_str(),
+                    name = %question.log_name(),
+                    record = %question.record_type(),
+                    %address,
+                    "hijacked DNS query"
+                ),
+                None => info!(
+                    client = %peer,
+                    transport = transport.as_str(),
+                    name = %question.log_name(),
+                    record = %question.record_type(),
+                    "hijacked DNS query with an empty answer"
+                ),
+            }
+            Some(reply)
+        }
         QueryAction::Forward(question) => {
+            debug!(
+                client = %peer,
+                name = %question.log_name(),
+                record = %question.record_type(),
+                transport = transport.as_str(),
+                upstream = %config.upstream,
+                "forwarding DNS query"
+            );
             let reply = match transport {
                 Transport::Udp => exchange_udp(query, config.upstream).await,
                 Transport::Tcp => exchange_tcp(query, config.upstream).await,
             };
             match reply {
                 Ok(reply) if response_matches_request(&reply, query) => Some(reply),
-                _ => Some(error_response(query, Some(&question), 2)),
+                Ok(_) => {
+                    warn!(
+                        client = %peer,
+                        name = %question.log_name(),
+                        record = %question.record_type(),
+                        transport = transport.as_str(),
+                        upstream = %config.upstream,
+                        "DNS upstream returned a mismatched response"
+                    );
+                    Some(error_response(query, Some(&question), 2))
+                }
+                Err(error) => {
+                    warn!(
+                        client = %peer,
+                        name = %question.log_name(),
+                        record = %question.record_type(),
+                        transport = transport.as_str(),
+                        upstream = %config.upstream,
+                        error = %format_args!("{error:#}"),
+                        "DNS upstream query failed"
+                    );
+                    Some(error_response(query, Some(&question), 2))
+                }
             }
         }
     }
@@ -186,6 +261,11 @@ fn response_matches_request(reply: &[u8], query: &[u8]) -> bool {
 enum QueryAction {
     Ignore,
     Reply(Vec<u8>),
+    Hijack {
+        reply: Vec<u8>,
+        question: Question,
+        address: Option<IpAddr>,
+    },
     Forward(Question),
 }
 
@@ -194,6 +274,25 @@ struct Question {
     labels: Vec<Vec<u8>>,
     qtype: u16,
     qclass: u16,
+}
+
+impl Question {
+    fn log_name(&self) -> String {
+        canonical_name(&self.labels).unwrap_or_else(|| "<invalid>".to_owned())
+    }
+
+    fn record_type(&self) -> Cow<'static, str> {
+        match self.qtype {
+            1 => "A".into(),
+            5 => "CNAME".into(),
+            28 => "AAAA".into(),
+            39 => "DNAME".into(),
+            64 => "SVCB".into(),
+            65 => "HTTPS".into(),
+            255 => "ANY".into(),
+            other => format!("TYPE{other}").into(),
+        }
+    }
 }
 
 fn classify_query(query: &[u8], config: &DnsConfig) -> QueryAction {
@@ -230,7 +329,14 @@ fn classify_query(query: &[u8], config: &DnsConfig) -> QueryAction {
         _ => None,
     };
     match address {
-        Some(address) => QueryAction::Reply(local_response(query, &question, address)),
+        Some(address) => {
+            let reply = local_response(query, &question, address);
+            QueryAction::Hijack {
+                reply,
+                question,
+                address,
+            }
+        }
         None => QueryAction::Forward(question),
     }
 }
@@ -438,8 +544,10 @@ pub async fn resolve_host(host: &str, port: u16, resolver: SocketAddr) -> Result
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        debug!(%host, %port, "upstream host is an IP address");
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
+    debug!(%host, %port, %resolver, "resolving upstream host");
     let name = encode_host_name(host)?;
     let (v4, v6) = timeout(RESOLUTION_TIMEOUT, async {
         futures::join!(
@@ -459,6 +567,7 @@ pub async fn resolve_host(host: &str, port: u16, resolver: SocketAddr) -> Result
         }
     }
     if !addresses.is_empty() {
+        debug!(%host, count = addresses.len(), "resolved upstream host");
         return Ok(addresses);
     }
     match (v4, v6) {
@@ -680,6 +789,14 @@ mod tests {
     }
 
     #[test]
+    fn formats_known_and_unknown_record_types() {
+        let known = parse_question(&query("example.com", 1)).unwrap();
+        let unknown = parse_question(&query("example.com", 65400)).unwrap();
+        assert_eq!(known.record_type(), "A");
+        assert_eq!(unknown.record_type(), "TYPE65400");
+    }
+
+    #[test]
     fn forwarded_reply_requires_the_original_question_and_opcode() {
         let request = query("Example.ORG", 1);
         let mut reply = request.clone();
@@ -740,11 +857,12 @@ mod tests {
                 });
 
                 let request = query("other.example.org", 1);
-                let rejected = handle_query(&request, &config, Transport::Udp)
+                let client = "127.0.0.1:12345".parse().unwrap();
+                let rejected = handle_query(&request, &config, Transport::Udp, client)
                     .await
                     .unwrap();
                 assert_eq!(rejected[3] & 0x0f, 2); // SERVFAIL.
-                let accepted = handle_query(&request, &config, Transport::Udp)
+                let accepted = handle_query(&request, &config, Transport::Udp, client)
                     .await
                     .unwrap();
                 assert_eq!(accepted[3] & 0x0f, 0);
@@ -761,11 +879,11 @@ mod tests {
         let cfg = config();
         assert!(matches!(
             classify_query(&query("EXAMPLE.com", 1), &cfg),
-            QueryAction::Reply(_)
+            QueryAction::Hijack { .. }
         ));
         assert!(matches!(
             classify_query(&query("sub.example.com", 1), &cfg),
-            QueryAction::Reply(_)
+            QueryAction::Hijack { .. }
         ));
         assert!(matches!(
             classify_query(&query("notexample.com", 1), &cfg),
@@ -780,7 +898,7 @@ mod tests {
         for name in ["a.example.com", "b.a.EXAMPLE.com"] {
             assert!(matches!(
                 classify_query(&query(name, 1), &cfg),
-                QueryAction::Reply(_)
+                QueryAction::Hijack { .. }
             ));
         }
         for name in ["example.com", "notexample.com", "a.example.com.evil"] {
@@ -798,7 +916,7 @@ mod tests {
         for name in ["example.com", "other.test", "a.b.example.org"] {
             assert!(matches!(
                 classify_query(&query(name, 1), &cfg),
-                QueryAction::Reply(_)
+                QueryAction::Hijack { .. }
             ));
         }
 
@@ -818,7 +936,7 @@ mod tests {
     fn rewrites_address_and_suppresses_bypass_records() {
         let cfg = config();
         let a = match classify_query(&query("a.example.com", 1), &cfg) {
-            QueryAction::Reply(packet) => packet,
+            QueryAction::Hijack { reply, .. } => reply,
             _ => panic!("expected local answer"),
         };
         assert_eq!(&a[0..2], &[0x12, 0x34]);
@@ -826,7 +944,7 @@ mod tests {
         assert!(a.ends_with(&[192, 0, 2, 44]));
         for kind in [5, 28, 39, 64, 65, 255] {
             let answer = match classify_query(&query("a.example.com", kind), &cfg) {
-                QueryAction::Reply(packet) => packet,
+                QueryAction::Hijack { reply, .. } => reply,
                 _ => panic!("expected local empty answer"),
             };
             assert_eq!(u16::from_be_bytes([answer[6], answer[7]]), 0);
@@ -862,7 +980,7 @@ mod tests {
         packet.extend_from_slice(&[0xc0, 0x12, 0, 1, 0, 1]);
         packet.extend_from_slice(&name);
         let answer = match classify_query(&packet, &cfg) {
-            QueryAction::Reply(packet) => packet,
+            QueryAction::Hijack { reply, .. } => reply,
             _ => panic!("expected local answer"),
         };
         let (labels, end) = decode_name(&answer, 12).unwrap();

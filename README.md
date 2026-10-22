@@ -20,6 +20,21 @@ All runtime settings are in TOML. The included [example/config.toml](example/con
 ./target/release/tls-mitm --config config.local.toml
 ```
 
+Logs are written to standard error at `info` level by default. Set `RUST_LOG`
+to change the level globally or for one module. The available levels are
+`error`, `warn`, `info`, `debug`, and `trace`; the application currently emits
+through `debug` and does not log application payloads. Colors are enabled when
+standard error is connected to a capable terminal. Set `NO_COLOR=1` to disable
+them explicitly.
+
+```sh
+# Include connection, DNS forwarding, certificate-cache, and capture details.
+RUST_LOG=tls_mitm=debug ./target/release/tls-mitm --config config.local.toml
+
+# Keep the default level elsewhere and enable only DNS debug events.
+RUST_LOG=tls_mitm=info,tls_mitm::dns=debug ./target/release/tls-mitm
+```
+
 A minimal configuration can use an unprivileged local port:
 
 ```toml

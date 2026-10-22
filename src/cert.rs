@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
 const LEAF_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -103,6 +104,7 @@ impl CertificateAuthority {
         cache.prune_expired(now);
         if let Some(found) = cache.entries.get(&host) {
             if now < found.renew_at {
+                debug!(%host, "reusing cached leaf certificate");
                 return Ok(found.credentials.clone());
             }
         }
@@ -127,11 +129,17 @@ impl CertificateAuthority {
                 // Keep serving a still-valid leaf if an early renewal fails.
                 // The next request will retry; failures are never cached.
                 if let Some(previous) = previous {
+                    warn!(
+                        %host,
+                        error = %format_args!("{error:#}"),
+                        "leaf certificate renewal failed; using cached certificate"
+                    );
                     return Ok(previous);
                 }
                 return Err(error);
             }
         };
+        debug!(%host, "issued leaf certificate");
         let leaf = Arc::new(leaf);
         let expires_at = signing_started + LEAF_VALIDITY;
         cache.entries.insert(

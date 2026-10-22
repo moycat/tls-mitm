@@ -2,7 +2,6 @@ use crate::capture::{CaptureFlow, CaptureHub};
 use crate::cert::{normalize_dns_name, CertificateAuthority};
 use crate::dns::resolve_host;
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{SecondsFormat, Utc};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
@@ -17,6 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
+use tracing::{debug, info, warn};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -171,6 +171,15 @@ fn select_route<'a>(routes: &'a [Route], name: &str) -> Option<&'a Route> {
         .max_by_key(|route| (route.pattern == name, route.pattern.len()))
 }
 
+fn format_upstream_uri(tls: bool, host: &str, port: u16) -> String {
+    let scheme = if tls { "tls" } else { "tcp" };
+    if matches!(host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+        format!("{scheme}://[{host}]:{port}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyConfig {
     pub listen: SocketAddr,
@@ -232,13 +241,13 @@ impl Proxy {
                 .local_addr()
                 .context("get local TLS listener address")?;
             let mut log = ConnectionLog::new(peer, local);
-            log.info("accepted");
+            log.debug("accepted");
             let permit = permits.clone().acquire_owned().await?;
             let config = self.config.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(error) = handle(socket, config, &mut log).await {
-                    log.error(&format!("{error:#}"));
+                    log.warn(&error);
                 }
             });
         }
@@ -264,21 +273,68 @@ impl ConnectionLog {
         }
     }
 
-    fn info(&self, message: &str) {
-        self.write("INFO", message);
+    fn debug(&self, event: &str) {
+        debug!(
+            client = %self.peer,
+            local = %self.local,
+            sni = self.sni.as_deref().unwrap_or("-"),
+            host = self.host.as_deref().unwrap_or("-"),
+            event,
+            "proxy connection"
+        );
     }
 
-    fn error(&self, message: &str) {
-        self.write("ERROR", message);
+    fn configured_route(&self, route: &str, upstream: &str, verify: &str) {
+        info!(
+            client = %self.peer,
+            host = self.host.as_deref().unwrap_or("-"),
+            route,
+            upstream,
+            verify,
+            "matched configured route"
+        );
     }
 
-    fn write(&self, level: &str, message: &str) {
-        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let sni = self.sni.as_deref().unwrap_or("-");
-        let host = self.host.as_deref().unwrap_or("-");
-        eprintln!(
-            "{timestamp} {level} client={} local={} sni={sni} host={host} {message}",
-            self.peer, self.local
+    fn host_upstream(&self, upstream: &str, verify: &str) {
+        info!(
+            client = %self.peer,
+            host = self.host.as_deref().unwrap_or("-"),
+            upstream,
+            verify,
+            "using host as upstream"
+        );
+    }
+
+    fn upstream_connected(&self, address: SocketAddr) {
+        debug!(
+            client = %self.peer,
+            local = %self.local,
+            sni = self.sni.as_deref().unwrap_or("-"),
+            host = self.host.as_deref().unwrap_or("-"),
+            upstream = %address,
+            "connected to upstream"
+        );
+    }
+
+    fn closed(&self, sent: u64, received: u64) {
+        info!(
+            client = %self.peer,
+            host = self.host.as_deref().unwrap_or("-"),
+            client_to_upstream_bytes = sent,
+            upstream_to_client_bytes = received,
+            duration_ms = self.started.elapsed().as_millis(),
+            "proxy connection closed"
+        );
+    }
+
+    fn warn(&self, error: &anyhow::Error) {
+        warn!(
+            client = %self.peer,
+            local = %self.local,
+            sni = self.sni.as_deref().unwrap_or("-"),
+            host = self.host.as_deref().unwrap_or("-"),
+            error = %format_args!("{error:#}"),
+            "proxy connection failed"
         );
     }
 }
@@ -307,7 +363,7 @@ async fn handle(
         log.sni = Some(name.clone());
     }
     log.host = Some(name.clone());
-    log.info("client_hello");
+    log.debug("client_hello");
     let offered_alpn: Vec<Vec<u8>> = start
         .client_hello()
         .alpn()
@@ -331,30 +387,22 @@ async fn handle(
             name.as_str(),
         ),
     };
-    log.info(&format!(
-        "route={} upstream={}://{}:{} verify={} verify_name={}",
-        route
-            .map(|route| route.pattern.as_str())
-            .unwrap_or("default"),
-        if target_tls { "tls" } else { "tcp" },
-        target_host,
-        target_port,
-        if target_tls {
-            if verify {
-                "true"
-            } else {
-                "false"
-            }
-        } else {
-            "-"
-        },
-        if target_tls { verify_name } else { "-" }
-    ));
+    let upstream_uri = format_upstream_uri(target_tls, target_host, target_port);
+    let verification_name = if target_tls && verify {
+        verify_name
+    } else {
+        ""
+    };
+    if let Some(route) = route {
+        log.configured_route(&route.pattern, &upstream_uri, verification_name);
+    } else {
+        log.host_upstream(&upstream_uri, verification_name);
+    }
     let addresses = resolve_host(target_host, target_port, config.resolver)
         .await
         .with_context(|| format!("resolve upstream {target_host}"))?;
     let tcp = connect_first(&addresses).await?;
-    log.info(&format!("upstream_connected address={}", tcp.peer_addr()?));
+    log.upstream_connected(tcp.peer_addr()?);
 
     let (upstream, selected_alpn): (Box<dyn Duplex>, Option<Vec<u8>>) = if target_tls {
         let mut client_config = (*config.upstream_client).clone();
@@ -395,7 +443,7 @@ async fn handle(
     )
     .await
     .context("downstream TLS handshake timeout")??;
-    log.info("tls_handshake_complete");
+    log.debug("tls_handshake_complete");
 
     let flow = config
         .capture
@@ -411,10 +459,7 @@ async fn handle(
         flow.close();
     }
     let (sent, received) = result?;
-    log.info(&format!(
-        "closed client_to_upstream_bytes={sent} upstream_to_client_bytes={received} duration_ms={}",
-        log.started.elapsed().as_millis()
-    ));
+    log.closed(sent, received);
     Ok(())
 }
 
@@ -589,6 +634,22 @@ mod tests {
         ] {
             assert!(Route::parse(&format!("{invalid}=127.0.0.1:8000")).is_err());
         }
+    }
+
+    #[test]
+    fn upstream_uri_includes_scheme_port_and_ipv6_brackets() {
+        assert_eq!(
+            format_upstream_uri(true, "upstream.example", 443),
+            "tls://upstream.example:443"
+        );
+        assert_eq!(
+            format_upstream_uri(false, "192.0.2.1", 8080),
+            "tcp://192.0.2.1:8080"
+        );
+        assert_eq!(
+            format_upstream_uri(true, "2001:db8::1", 8443),
+            "tls://[2001:db8::1]:8443"
+        );
     }
 
     #[test]

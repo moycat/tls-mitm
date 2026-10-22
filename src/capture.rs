@@ -21,6 +21,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::JoinHandle;
+use tracing::{debug, error, warn};
 
 const PCAP_HEADER: [u8; 24] = [
     0xd4, 0xc3, 0xb2, 0xa1, // little-endian classic PCAP magic
@@ -126,8 +127,11 @@ pub async fn start_capture(
                     Err(error) => {
                         accept_errors = accept_errors.saturating_add(1);
                         if accept_errors.is_power_of_two() {
-                            eprintln!(
-                                "PCAP TCP listener {listener_address}: accept failed ({accept_errors} consecutive errors): {error}"
+                            warn!(
+                                listener = %listener_address,
+                                consecutive_errors = accept_errors,
+                                error = %error,
+                                "failed to accept PCAP viewer connection"
                             );
                         }
                         tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
@@ -202,7 +206,11 @@ fn output_worker(target: OutputTarget, receiver: Receiver<Arc<[u8]>>, stop: Arc<
                 match receiver.recv_timeout(OUTPUT_RETRY_DELAY) {
                     Ok(record) => {
                         if let Err(error) = file.write_all(&record) {
-                            eprintln!("capture output {}: {error}", path.display());
+                            error!(
+                                path = %path.display(),
+                                error = %error,
+                                "failed to write capture output"
+                            );
                             break;
                         }
                     }
@@ -224,7 +232,11 @@ fn output_worker(target: OutputTarget, receiver: Receiver<Arc<[u8]>>, stop: Arc<
                 }
             }
             if let Err(error) = file.flush() {
-                eprintln!("capture output {}: {error}", path.display());
+                error!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to flush capture output"
+                );
             }
         }
         OutputTarget::Fifo(path) => output_fifo(path, receiver, stop),
@@ -321,9 +333,12 @@ fn output_fifo(path: PathBuf, receiver: Receiver<Arc<[u8]>>, stop: Arc<AtomicBoo
 fn log_fifo_error(path: &Path, operation: &str, error: &io::Error, count: &mut u64) {
     *count = count.saturating_add(1);
     if count.is_power_of_two() {
-        eprintln!(
-            "capture FIFO {}: {operation} failed: {error} ({count} occurrences)",
-            path.display()
+        warn!(
+            path = %path.display(),
+            operation,
+            occurrences = *count,
+            error = %error,
+            "capture FIFO operation failed"
         );
     }
 }
@@ -331,9 +346,10 @@ fn log_fifo_error(path: &Path, operation: &str, error: &io::Error, count: &mut u
 fn log_fifo_disconnect(path: &Path, count: &mut u64) {
     *count = count.saturating_add(1);
     if count.is_power_of_two() {
-        eprintln!(
-            "capture FIFO {}: reader disconnected ({count} occurrences)",
-            path.display()
+        debug!(
+            path = %path.display(),
+            occurrences = *count,
+            "capture FIFO reader disconnected"
         );
     }
 }
@@ -341,9 +357,10 @@ fn log_fifo_disconnect(path: &Path, count: &mut u64) {
 fn log_fifo_drop(path: &Path, count: &mut u64) {
     *count = count.saturating_add(1);
     if count.is_power_of_two() {
-        eprintln!(
-            "capture FIFO {}: dropped PCAP records ({count} total)",
-            path.display()
+        warn!(
+            path = %path.display(),
+            dropped_records = *count,
+            "capture FIFO dropped PCAP records"
         );
     }
 }
@@ -448,22 +465,43 @@ impl CaptureOutput {
             let previous = self.slow_viewers.fetch_add(slow_viewers, Ordering::Relaxed);
             let total = previous.saturating_add(slow_viewers);
             if previous == 0 || previous.leading_zeros() != total.leading_zeros() {
-                eprintln!("capture TCP viewer queue full: disconnected {total} slow viewers");
+                warn!(
+                    disconnected_viewers = total,
+                    "capture viewer queue full; disconnected slow viewers"
+                );
             }
         }
         if let Some(file) = &self.file {
             // The disk/FIFO writer is independent of the proxy. An output that
             // cannot keep up drops records once its bounded queue fills.
             if let Err(error) = file.try_send(record) {
-                let (reason, counter) = match error {
-                    std_mpsc::TrySendError::Full(_) => ("queue full", &self.file_queue_drops),
-                    std_mpsc::TrySendError::Disconnected(_) => {
-                        ("writer stopped", &self.file_disconnect_drops)
+                match error {
+                    std_mpsc::TrySendError::Full(_) => {
+                        let total = self
+                            .file_queue_drops
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        if total.is_power_of_two() {
+                            warn!(
+                                reason = "queue_full",
+                                dropped_records = total,
+                                "capture output dropped PCAP records"
+                            );
+                        }
                     }
-                };
-                let total = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-                if total.is_power_of_two() {
-                    eprintln!("capture output {reason}: dropped {total} PCAP records");
+                    std_mpsc::TrySendError::Disconnected(_) => {
+                        let total = self
+                            .file_disconnect_drops
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        if total.is_power_of_two() {
+                            error!(
+                                reason = "writer_stopped",
+                                dropped_records = total,
+                                "capture output dropped PCAP records"
+                            );
+                        }
+                    }
                 }
             }
         }
