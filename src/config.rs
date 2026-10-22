@@ -250,7 +250,7 @@ fn dns_config(file: DnsFile, resolver: SocketAddr) -> Result<DnsConfig> {
     let domains = file
         .domains
         .iter()
-        .map(|name| normalize_dns_name(name).context("invalid dns.domains entry"))
+        .map(|name| normalize_dns_pattern(name).context("invalid dns.domains entry"))
         .collect::<Result<Vec<_>>>()?;
     if !file.all && domains.is_empty() {
         bail!("[dns] requires all = true or at least one domain");
@@ -268,6 +268,16 @@ fn dns_config(file: DnsFile, resolver: SocketAddr) -> Result<DnsConfig> {
         hijack_all: file.all,
         domains,
     })
+}
+
+fn normalize_dns_pattern(pattern: &str) -> Result<String> {
+    if pattern == "*" {
+        return Ok(pattern.to_owned());
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return Ok(format!("*.{}", normalize_dns_name(suffix)?));
+    }
+    normalize_dns_name(pattern)
 }
 
 fn capture_config(file: CaptureFile, base: &Path) -> Result<CaptureSettings> {
@@ -435,6 +445,42 @@ output = 'captures/current.pcap'
             capture.output,
             Some(dir.path().canonicalize().unwrap().join("capture.fifo"))
         );
+    }
+
+    #[test]
+    fn parses_dns_wildcard_patterns() {
+        let config = load_text(
+            "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+             [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\n\
+             domains = ['*.EXAMPLE.com.', '*.example.com', 'example.com', '*']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.dns.unwrap().domains,
+            ["*.example.com", "example.com", "*"]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_dns_wildcard_patterns() {
+        let base = "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+                    [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\n";
+        for bad in [
+            "*.",
+            "*..example.com",
+            "*.*.example.com",
+            "*example.com",
+            "foo*.example.com",
+            "foo.*.example.com",
+            "a*b.com",
+            "*.bad_name",
+        ] {
+            let error = load_text(&format!("{base}domains = ['{bad}']\n")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("invalid dns.domains entry"),
+                "{bad}: {error:#}"
+            );
+        }
     }
 
     #[test]

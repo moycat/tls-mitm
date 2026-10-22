@@ -67,7 +67,7 @@ verify = false
 
 `tls://` may be omitted. A TLS route verifies its upstream certificate against the requested SNI by default; `verify_name` selects a different certificate name. `verify = false` disables upstream certificate verification for that TLS route only and cannot be combined with `verify_name`. `tcp://` sends decrypted bytes to a plain TCP upstream and does not accept TLS verification settings.
 
-Specify an upstream port either after the host in `upstream` or as `route.upstream_port`; specifying both is an error. If neither is set, the route uses `proxy.upstream_port`, or the listener's port if that is also unset. Exact routes take precedence over wildcard routes. `*.example.net` matches subdomains but not the apex name. If a client omits SNI, set `proxy.default_host = "example.com"` to give it an explicit default hostname.
+Specify an upstream port either after the host in `upstream` or as `route.upstream_port`; specifying both is an error. If neither is set, the route uses `proxy.upstream_port`, or the listener's port if that is also unset. A route domain such as `api.example.com` matches that name exactly; `*.example.net` matches subdomains at any depth but not the apex name. Set `route.domain = "*"` for a catch-all fallback. Exact routes take precedence over suffix wildcards, which take precedence over `"*"`. Route matching is case-insensitive, and partial-label wildcards such as `api*.example.com` are invalid. If a client omits SNI, set `proxy.default_host = "example.com"` to give it an explicit default hostname. `proxy.default_host` and `route.verify_name` must be concrete DNS names, not wildcard patterns.
 
 ### Provide DNS to a test device
 
@@ -86,7 +86,9 @@ ip = "192.0.2.10"
 all = true
 ```
 
-To rewrite only selected domains and their subdomains, set `all = false` and add `domains = ["example.com", "example.net"]`. To answer AAAA queries, set `ip6` to a reachable local IPv6 address. The DNS service handles both UDP and TCP. It returns the configured address for rewritten A and AAAA queries, or an empty answer when that address family is not configured. For rewritten domains it also returns empty CNAME, DNAME, SVCB, HTTPS, and ANY answers, so those records cannot direct the client toward an alias, HTTP/3, or ECH. Other record types are forwarded to `proxy.resolver`. Do not point `proxy.resolver` at this tool's DNS listener.
+To select names for DNS rewriting, set `all = false` and add `domains = ["example.com", "*.example.net"]`. `example.com` matches both the apex name and its subdomains; `*.example.net` matches subdomains at any depth but not `example.net` itself. A domain entry of `"*"` matches every name. Matching is case-insensitive. Wildcards must be the entire entry or a leading `*.`; partial-label forms such as `api*.example.com` are invalid.
+
+To answer AAAA queries, set `ip6` to a reachable local IPv6 address. The DNS service handles both UDP and TCP. It returns the configured address for rewritten A and AAAA queries, or an empty answer when that address family is not configured. For rewritten domains it also returns empty CNAME, DNAME, SVCB, HTTPS, and ANY answers, so those records cannot direct the client toward an alias, HTTP/3, or ECH. Other record types are forwarded to `proxy.resolver`. Do not point `proxy.resolver` at this tool's DNS listener.
 
 ### View decrypted traffic in Wireshark
 

@@ -37,7 +37,9 @@ impl Route {
         let (pattern, target) = spec.split_once('=').ok_or_else(|| {
             anyhow!("route must be DOMAIN=tls://HOST[:PORT] or DOMAIN=tcp://HOST[:PORT]")
         })?;
-        let pattern = if let Some(rest) = pattern.strip_prefix("*.") {
+        let pattern = if pattern == "*" {
+            pattern.to_owned()
+        } else if let Some(rest) = pattern.strip_prefix("*.") {
             format!("*.{}", normalize_dns_name(rest)?)
         } else {
             normalize_dns_name(pattern)?
@@ -61,7 +63,9 @@ impl Route {
     }
 
     fn matches(&self, name: &str) -> bool {
-        if let Some(suffix) = self.pattern.strip_prefix("*.") {
+        if self.pattern == "*" {
+            true
+        } else if let Some(suffix) = self.pattern.strip_prefix("*.") {
             name.len() > suffix.len() + 1
                 && name.ends_with(suffix)
                 && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
@@ -164,7 +168,7 @@ fn select_route<'a>(routes: &'a [Route], name: &str) -> Option<&'a Route> {
     routes
         .iter()
         .filter(|route| route.matches(name))
-        .max_by_key(|route| route.pattern.len())
+        .max_by_key(|route| (route.pattern == name, route.pattern.len()))
 }
 
 #[derive(Clone)]
@@ -552,6 +556,39 @@ mod tests {
         );
         assert!(select_route(&routes, "example.com").is_none());
         assert!(select_route(&routes, "badexample.com").is_none());
+    }
+
+    #[test]
+    fn catch_all_route_is_fallback_to_exact_and_suffix_wildcard() {
+        let routes = vec![
+            Route::parse("a.example.com=tcp://127.0.0.1:8001").unwrap(),
+            Route::parse("*.example.com=tcp://127.0.0.1:8002").unwrap(),
+            Route::parse("*=tcp://127.0.0.1:8003").unwrap(),
+        ];
+        assert_eq!(
+            select_route(&routes, "a.example.com").unwrap().port,
+            Some(8001)
+        );
+        assert_eq!(
+            select_route(&routes, "b.example.com").unwrap().port,
+            Some(8002)
+        );
+        assert_eq!(
+            select_route(&routes, "example.com").unwrap().port,
+            Some(8003)
+        );
+        assert_eq!(
+            select_route(&routes, "other.test").unwrap().port,
+            Some(8003)
+        );
+        for invalid in [
+            "*.",
+            "api*.example.com",
+            "api.*.example.com",
+            "**.example.com",
+        ] {
+            assert!(Route::parse(&format!("{invalid}=127.0.0.1:8000")).is_err());
+        }
     }
 
     #[test]

@@ -24,13 +24,18 @@ upstream_port = 8080 # Send decrypted bytes to a plain TCP service.
 
 # For a TLS route with verify = true (the default), you may instead set
 # verify_name = "backend.example.test" to verify a different certificate name.
+# A route with domain = "*" is a catch-all fallback after exact and *.suffix
+# routes. default_host and verify_name must be concrete DNS names.
 
 # To direct a test device's DNS to this host, supply an IP reachable from it.
 # [dns]
 # listen = "0.0.0.0:53"
 # ip = "192.0.2.10"
 # all = true
-# domains = ["example.com"] # Used when all = false.
+# domains = ["example.com", "*.lab.example.net"] # Used when all = false.
+# "example.com" includes the apex and its subdomains; "*.lab.example.net"
+# includes subdomains only. "*" matches every name. Matching ignores case.
+# Partial-label wildcards such as "api*.example.com" are invalid.
 
 # To stream decrypted PCAP to Wireshark, enable a loopback TCP listener.
 # Packets use the client's actual IP:source port and this proxy's accepted

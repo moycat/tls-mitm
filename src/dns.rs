@@ -31,7 +31,8 @@ pub struct DnsConfig {
     pub answer_v4: Option<Ipv4Addr>,
     pub answer_v6: Option<Ipv6Addr>,
     pub hijack_all: bool,
-    /// Each entry matches itself and its subdomains, on a DNS label boundary.
+    /// A plain name matches itself and its subdomains; `*.name` matches only
+    /// subdomains, and `*` matches every name.
     pub domains: Vec<String>,
 }
 
@@ -239,12 +240,23 @@ fn matches_domain(labels: &[Vec<u8>], config: &DnsConfig) -> bool {
         return true;
     }
     config.domains.iter().any(|entry| {
-        let entry = entry.trim().trim_end_matches('.');
-        let entry = entry.strip_prefix("*.").unwrap_or(entry);
+        let entry = entry.trim();
+        if entry == "*" {
+            return true;
+        }
+        let (entry, subdomain_only) = match entry.strip_prefix("*.") {
+            Some(base) => (base, true),
+            None => (entry, false),
+        };
+        let entry = entry.trim_end_matches('.');
+        if entry.contains('*') {
+            return false;
+        }
         let wanted: Vec<&[u8]> = entry.split('.').map(str::as_bytes).collect();
         !wanted.is_empty()
             && wanted.iter().all(|part| !part.is_empty())
             && labels.len() >= wanted.len()
+            && (!subdomain_only || labels.len() > wanted.len())
             && labels[labels.len() - wanted.len()..]
                 .iter()
                 .zip(wanted)
@@ -757,6 +769,47 @@ mod tests {
         ));
         assert!(matches!(
             classify_query(&query("notexample.com", 1), &cfg),
+            QueryAction::Forward(_)
+        ));
+    }
+
+    #[test]
+    fn wildcard_domain_matches_proper_subdomains_only() {
+        let mut cfg = config();
+        cfg.domains = vec!["*.Example.COM.".to_owned()];
+        for name in ["a.example.com", "b.a.EXAMPLE.com"] {
+            assert!(matches!(
+                classify_query(&query(name, 1), &cfg),
+                QueryAction::Reply(_)
+            ));
+        }
+        for name in ["example.com", "notexample.com", "a.example.com.evil"] {
+            assert!(matches!(
+                classify_query(&query(name, 1), &cfg),
+                QueryAction::Forward(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn star_matches_all_names_but_partial_label_globs_do_not() {
+        let mut cfg = config();
+        cfg.domains = vec!["*".to_owned()];
+        for name in ["example.com", "other.test", "a.b.example.org"] {
+            assert!(matches!(
+                classify_query(&query(name, 1), &cfg),
+                QueryAction::Reply(_)
+            ));
+        }
+
+        cfg.domains = vec!["api*.example.com".to_owned()];
+        assert!(matches!(
+            classify_query(&query("api1.example.com", 1), &cfg),
+            QueryAction::Forward(_)
+        ));
+        cfg.domains = vec!["*.".to_owned()];
+        assert!(matches!(
+            classify_query(&query("api1.example.com", 1), &cfg),
             QueryAction::Forward(_)
         ));
     }

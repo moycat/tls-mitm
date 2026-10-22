@@ -483,7 +483,7 @@ async fn exercise_dns() -> Result<()> {
         answer_v4: Some(Ipv4Addr::LOCALHOST),
         answer_v6: None,
         hijack_all: false,
-        domains: vec!["test.example".to_owned()],
+        domains: vec!["test.example".to_owned(), "*.wild.example".to_owned()],
     }));
 
     let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -516,6 +516,31 @@ async fn exercise_dns() -> Result<()> {
     let mut reply = vec![0; u16::from_be_bytes(reply_len) as usize];
     tcp.read_exact(&mut reply).await?;
     assert_dns_loopback_answer(&query, &reply);
+
+    let mut wildcard_query = vec![0x12, 0x35, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in [
+        b"host".as_slice(),
+        b"wild".as_slice(),
+        b"example".as_slice(),
+    ] {
+        wildcard_query.push(label.len() as u8);
+        wildcard_query.extend_from_slice(label);
+    }
+    wildcard_query.extend_from_slice(&[0, 0, 1, 0, 1]);
+
+    let wildcard_udp = UdpSocket::bind("127.0.0.1:0").await?;
+    wildcard_udp.connect(address).await?;
+    wildcard_udp.send(&wildcard_query).await?;
+    let wildcard_len = timeout(Duration::from_secs(1), wildcard_udp.recv(&mut response)).await??;
+    assert_dns_loopback_answer(&wildcard_query, &response[..wildcard_len]);
+
+    tcp.write_all(&(wildcard_query.len() as u16).to_be_bytes())
+        .await?;
+    tcp.write_all(&wildcard_query).await?;
+    tcp.read_exact(&mut reply_len).await?;
+    let mut wildcard_reply = vec![0; u16::from_be_bytes(reply_len) as usize];
+    tcp.read_exact(&mut wildcard_reply).await?;
+    assert_dns_loopback_answer(&wildcard_query, &wildcard_reply);
 
     dns_task.abort();
     Ok(())
