@@ -1,6 +1,7 @@
 use crate::capture::{CaptureFlow, CaptureHub};
-use crate::cert::{normalize_dns_name, CertificateAuthority};
+use crate::cert::CertificateAuthority;
 use crate::dns::resolve_host;
+use crate::domain::{normalize_dns_name, DomainPattern};
 use anyhow::{anyhow, bail, Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
@@ -24,9 +25,9 @@ const MAX_CONNECTIONS: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct Route {
-    pub pattern: String,
+    pub pattern: DomainPattern,
     pub host: String,
-    pub port: Option<u16>,
+    pub port: u16,
     pub tls: bool,
     pub verify: bool,
     pub verify_name: Option<String>,
@@ -35,21 +36,15 @@ pub struct Route {
 impl Route {
     pub fn parse(spec: &str) -> Result<Self> {
         let (pattern, target) = spec.split_once('=').ok_or_else(|| {
-            anyhow!("route must be DOMAIN=tls://HOST[:PORT] or DOMAIN=tcp://HOST[:PORT]")
+            anyhow!("route must be DOMAIN=tls://HOST:PORT or DOMAIN=tcp://HOST:PORT")
         })?;
-        let pattern = if pattern == "*" {
-            pattern.to_owned()
-        } else if let Some(rest) = pattern.strip_prefix("*.") {
-            format!("*.{}", normalize_dns_name(rest)?)
-        } else {
-            normalize_dns_name(pattern)?
-        };
+        let pattern = DomainPattern::parse(pattern)?;
         let (tls, target) = if let Some(rest) = target.strip_prefix("tcp://") {
             (false, rest)
         } else if let Some(rest) = target.strip_prefix("tls://") {
             (true, rest)
         } else {
-            (true, target)
+            bail!("route upstream must start with tls:// or tcp://");
         };
         let (host, port) = split_host_port(target)?;
         Ok(Self {
@@ -63,19 +58,11 @@ impl Route {
     }
 
     fn matches(&self, name: &str) -> bool {
-        if self.pattern == "*" {
-            true
-        } else if let Some(suffix) = self.pattern.strip_prefix("*.") {
-            name.len() > suffix.len() + 1
-                && name.ends_with(suffix)
-                && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
-        } else {
-            self.pattern == name
-        }
+        self.pattern.matches_normalized_name(name)
     }
 }
 
-fn split_host_port(target: &str) -> Result<(String, Option<u16>)> {
+fn split_host_port(target: &str) -> Result<(String, u16)> {
     let (host, port) = if let Some(rest) = target.strip_prefix('[') {
         let (host, suffix) = rest
             .split_once(']')
@@ -104,9 +91,10 @@ fn split_host_port(target: &str) -> Result<(String, Option<u16>)> {
         normalize_dns_name(host)?;
     }
     let port = port
-        .map(|value| value.parse::<u16>().context("invalid upstream port"))
-        .transpose()?;
-    if port == Some(0) {
+        .context("upstream port is required")?
+        .parse::<u16>()
+        .context("invalid upstream port")?;
+    if port == 0 {
         bail!("upstream port must be nonzero");
     }
     Ok((host.to_owned(), port))
@@ -168,7 +156,7 @@ fn select_route<'a>(routes: &'a [Route], name: &str) -> Option<&'a Route> {
     routes
         .iter()
         .filter(|route| route.matches(name))
-        .max_by_key(|route| (route.pattern == name, route.pattern.len()))
+        .max_by_key(|route| route.pattern.specificity())
 }
 
 fn format_upstream_uri(tls: bool, host: &str, port: u16) -> String {
@@ -374,7 +362,7 @@ async fn handle(
     let (target_host, target_port, target_tls, verify, verify_name) = match route {
         Some(route) => (
             route.host.as_str(),
-            route.port.unwrap_or(config.default_upstream_port),
+            route.port,
             route.tls,
             route.verify,
             route.verify_name.as_deref().unwrap_or(&name),
@@ -394,7 +382,7 @@ async fn handle(
         ""
     };
     if let Some(route) = route {
-        log.configured_route(&route.pattern, &upstream_uri, verification_name);
+        log.configured_route(route.pattern.as_str(), &upstream_uri, verification_name);
     } else {
         log.host_upstream(&upstream_uri, verification_name);
     }
@@ -586,54 +574,79 @@ mod tests {
     }
 
     #[test]
-    fn route_matching_is_exact_or_label_bounded_suffix() {
+    fn route_matching_uses_dns_domain_rules() {
         let routes = vec![
-            Route::parse("*.example.com=127.0.0.1:8443").unwrap(),
+            Route::parse("*.example.com=tls://127.0.0.1:8443").unwrap(),
             Route::parse("api.example.com=tcp://127.0.0.1:8080").unwrap(),
         ];
+        assert_eq!(select_route(&routes, "api.example.com").unwrap().port, 8080);
         assert_eq!(
-            select_route(&routes, "api.example.com").unwrap().port,
-            Some(8080)
+            select_route(&routes, "deep.api.example.com").unwrap().port,
+            8080
         );
-        assert_eq!(
-            select_route(&routes, "www.example.com").unwrap().port,
-            Some(8443)
-        );
+        assert_eq!(select_route(&routes, "www.example.com").unwrap().port, 8443);
         assert!(select_route(&routes, "example.com").is_none());
         assert!(select_route(&routes, "badexample.com").is_none());
     }
 
     #[test]
-    fn catch_all_route_is_fallback_to_exact_and_suffix_wildcard() {
+    fn plain_route_matches_apex_and_subdomains_but_not_partial_labels() {
+        let routes = vec![Route::parse("example.com=tcp://127.0.0.1:8000").unwrap()];
+        for name in ["example.com", "a.example.com", "b.a.example.com"] {
+            assert!(select_route(&routes, name).is_some(), "{name}");
+        }
+        for name in ["badexample.com", "example.com.evil"] {
+            assert!(select_route(&routes, name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn route_selection_prefers_exact_then_narrowest_pattern_then_catch_all() {
         let routes = vec![
             Route::parse("a.example.com=tcp://127.0.0.1:8001").unwrap(),
             Route::parse("*.example.com=tcp://127.0.0.1:8002").unwrap(),
             Route::parse("*=tcp://127.0.0.1:8003").unwrap(),
+            Route::parse("example.com=tcp://127.0.0.1:8004").unwrap(),
         ];
+        assert_eq!(select_route(&routes, "a.example.com").unwrap().port, 8001);
+        assert_eq!(select_route(&routes, "b.example.com").unwrap().port, 8002);
+        assert_eq!(select_route(&routes, "example.com").unwrap().port, 8004);
         assert_eq!(
-            select_route(&routes, "a.example.com").unwrap().port,
-            Some(8001)
+            select_route(&routes, "deep.a.example.com").unwrap().port,
+            8001
         );
-        assert_eq!(
-            select_route(&routes, "b.example.com").unwrap().port,
-            Some(8002)
-        );
-        assert_eq!(
-            select_route(&routes, "example.com").unwrap().port,
-            Some(8003)
-        );
-        assert_eq!(
-            select_route(&routes, "other.test").unwrap().port,
-            Some(8003)
-        );
+        assert_eq!(select_route(&routes, "other.test").unwrap().port, 8003);
+
+        let short_routes = vec![
+            Route::parse("a=tcp://127.0.0.1:8004").unwrap(),
+            Route::parse("*=tcp://127.0.0.1:8003").unwrap(),
+        ];
+        assert_eq!(select_route(&short_routes, "x.a").unwrap().port, 8004);
         for invalid in [
             "*.",
             "api*.example.com",
             "api.*.example.com",
             "**.example.com",
         ] {
-            assert!(Route::parse(&format!("{invalid}=127.0.0.1:8000")).is_err());
+            assert!(Route::parse(&format!("{invalid}=tls://127.0.0.1:8000")).is_err());
         }
+    }
+
+    #[test]
+    fn route_upstream_requires_scheme_host_and_nonzero_port() {
+        for invalid in [
+            "example.com=127.0.0.1:443",
+            "example.com=tls://127.0.0.1",
+            "example.com=tcp://upstream.example",
+            "example.com=tls://127.0.0.1:0",
+            "example.com=tls://[2001:db8::1]",
+        ] {
+            assert!(Route::parse(invalid).is_err(), "{invalid}");
+        }
+
+        let route = Route::parse("example.com=tls://[2001:db8::1]:8443").unwrap();
+        assert_eq!(route.host, "2001:db8::1");
+        assert_eq!(route.port, 8443);
     }
 
     #[test]

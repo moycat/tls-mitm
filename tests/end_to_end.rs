@@ -9,6 +9,7 @@ use std::time::Duration;
 use tls_mitm::capture::start_capture;
 use tls_mitm::cert::CertificateAuthority;
 use tls_mitm::dns::{serve_dns, DnsConfig};
+use tls_mitm::domain::DomainPattern;
 use tls_mitm::proxy::{build_upstream_client, Proxy, ProxyConfig, Route};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -61,8 +62,10 @@ async fn exercise_proxy() -> Result<()> {
     assert_eq!(&global_header[..8], &[0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0]);
     assert_eq!(u32::from_le_bytes(global_header[20..24].try_into()?), 101); // DLT_RAW
 
-    let mut route = Route::parse("test.example=tls://127.0.0.1")?;
-    route.port = Some(upstream_addr.port());
+    let mut route = Route::parse(&format!(
+        "test.example=tls://127.0.0.1:{}",
+        upstream_addr.port()
+    ))?;
     route.verify = false;
     let proxy = Proxy::bind(ProxyConfig {
         listen: "127.0.0.1:0".parse()?,
@@ -180,8 +183,10 @@ async fn exercise_tcp_route() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     });
 
-    let mut route = Route::parse("test.example=tcp://127.0.0.1")?;
-    route.port = Some(upstream_addr.port());
+    let route = Route::parse(&format!(
+        "test.example=tcp://127.0.0.1:{}",
+        upstream_addr.port()
+    ))?;
     let proxy = Proxy::bind(ProxyConfig {
         listen: "127.0.0.1:0".parse()?,
         default_upstream_port: 443,
@@ -243,8 +248,10 @@ async fn exercise_cached_sni_certificate() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     });
 
-    let mut route = Route::parse("test.example=tcp://127.0.0.1")?;
-    route.port = Some(upstream_addr.port());
+    let route = Route::parse(&format!(
+        "test.example=tcp://127.0.0.1:{}",
+        upstream_addr.port()
+    ))?;
     let proxy = Proxy::bind(ProxyConfig {
         listen: "127.0.0.1:0".parse()?,
         default_upstream_port: 443,
@@ -321,8 +328,10 @@ async fn exercise_untrusted_tls_route() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     });
 
-    let mut route = Route::parse("test.example=tls://127.0.0.1")?;
-    route.port = Some(upstream_addr.port());
+    let route = Route::parse(&format!(
+        "test.example=tls://127.0.0.1:{}",
+        upstream_addr.port()
+    ))?;
     assert!(route.verify);
     let proxy = Proxy::bind(ProxyConfig {
         listen: "127.0.0.1:0".parse()?,
@@ -483,7 +492,10 @@ async fn exercise_dns() -> Result<()> {
         answer_v4: Some(Ipv4Addr::LOCALHOST),
         answer_v6: None,
         hijack_all: false,
-        domains: vec!["test.example".to_owned(), "*.wild.example".to_owned()],
+        domains: vec![
+            DomainPattern::parse("test.example")?,
+            DomainPattern::parse("*.wild.example")?,
+        ],
     }));
 
     let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];

@@ -7,20 +7,15 @@ upstream_port = 443
 resolver = "1.1.1.1:53"
 
 # Example routes use reserved test names; replace them with your own targets.
-# Choose one port style: upstream = "tls://192.0.2.20:9443" or
-# upstream = "tls://192.0.2.20" with upstream_port = 9443.
-# Setting both ports is an error. If neither is set, the route uses
-# proxy.upstream_port, or the proxy listen port when that is also unset.
+# Each route upstream includes its protocol, host, and nonzero port.
 [[route]]
 domain = "tls-demo.example.test"
-upstream = "tls://192.0.2.20"
-upstream_port = 9443
+upstream = "tls://192.0.2.20:9443"
 verify = false # Skip upstream TLS certificate validation for this route.
 
 [[route]]
 domain = "tcp-demo.example.test"
-upstream = "tcp://127.0.0.1"
-upstream_port = 8080 # Send decrypted bytes to a plain TCP service.
+upstream = "tcp://127.0.0.1:8080" # Send decrypted bytes to a plain TCP service.
 
 # For a TLS route with verify = true (the default), you may instead set
 # verify_name = "backend.example.test" to verify a different certificate name.

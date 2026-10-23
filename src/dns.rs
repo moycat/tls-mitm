@@ -18,6 +18,8 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::domain::DomainPattern;
+
 const MAX_MESSAGE: usize = u16::MAX as usize;
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,7 +37,7 @@ pub struct DnsConfig {
     pub hijack_all: bool,
     /// A plain name matches itself and its subdomains; `*.name` matches only
     /// subdomains, and `*` matches every name.
-    pub domains: Vec<String>,
+    pub domains: Vec<DomainPattern>,
 }
 
 /// Serve DNS over UDP and TCP on the same address. Both transports are required
@@ -345,29 +347,10 @@ fn matches_domain(labels: &[Vec<u8>], config: &DnsConfig) -> bool {
     if config.hijack_all {
         return true;
     }
-    config.domains.iter().any(|entry| {
-        let entry = entry.trim();
-        if entry == "*" {
-            return true;
-        }
-        let (entry, subdomain_only) = match entry.strip_prefix("*.") {
-            Some(base) => (base, true),
-            None => (entry, false),
-        };
-        let entry = entry.trim_end_matches('.');
-        if entry.contains('*') {
-            return false;
-        }
-        let wanted: Vec<&[u8]> = entry.split('.').map(str::as_bytes).collect();
-        !wanted.is_empty()
-            && wanted.iter().all(|part| !part.is_empty())
-            && labels.len() >= wanted.len()
-            && (!subdomain_only || labels.len() > wanted.len())
-            && labels[labels.len() - wanted.len()..]
-                .iter()
-                .zip(wanted)
-                .all(|(actual, wanted)| actual.eq_ignore_ascii_case(wanted))
-    })
+    config
+        .domains
+        .iter()
+        .any(|pattern| pattern.matches_wire_labels(labels))
 }
 
 fn parse_question(message: &[u8]) -> Option<Question> {
@@ -776,7 +759,7 @@ mod tests {
             answer_v4: Some(Ipv4Addr::new(192, 0, 2, 44)),
             answer_v6: None,
             hijack_all: false,
-            domains: vec!["Example.COM.".to_owned()],
+            domains: vec![DomainPattern::parse("Example.COM.").unwrap()],
         }
     }
 
@@ -894,7 +877,7 @@ mod tests {
     #[test]
     fn wildcard_domain_matches_proper_subdomains_only() {
         let mut cfg = config();
-        cfg.domains = vec!["*.Example.COM.".to_owned()];
+        cfg.domains = vec![DomainPattern::parse("*.Example.COM.").unwrap()];
         for name in ["a.example.com", "b.a.EXAMPLE.com"] {
             assert!(matches!(
                 classify_query(&query(name, 1), &cfg),
@@ -910,26 +893,15 @@ mod tests {
     }
 
     #[test]
-    fn star_matches_all_names_but_partial_label_globs_do_not() {
+    fn star_matches_all_names() {
         let mut cfg = config();
-        cfg.domains = vec!["*".to_owned()];
+        cfg.domains = vec![DomainPattern::parse("*").unwrap()];
         for name in ["example.com", "other.test", "a.b.example.org"] {
             assert!(matches!(
                 classify_query(&query(name, 1), &cfg),
                 QueryAction::Hijack { .. }
             ));
         }
-
-        cfg.domains = vec!["api*.example.com".to_owned()];
-        assert!(matches!(
-            classify_query(&query("api1.example.com", 1), &cfg),
-            QueryAction::Forward(_)
-        ));
-        cfg.domains = vec!["*.".to_owned()];
-        assert!(matches!(
-            classify_query(&query("api1.example.com", 1), &cfg),
-            QueryAction::Forward(_)
-        ));
     }
 
     #[test]

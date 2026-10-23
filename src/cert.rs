@@ -1,3 +1,4 @@
+pub use crate::domain::normalize_dns_name;
 use anyhow::{anyhow, bail, Context, Result};
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::pki_types::pem::PemObject;
@@ -233,26 +234,6 @@ fn run_openssl(cmd: &mut Command, step: &str) -> Result<()> {
         bail!("OpenSSL could not {step}: {}", stderr.trim());
     }
     Ok(())
-}
-
-pub fn normalize_dns_name(name: &str) -> Result<String> {
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
-    if name.is_empty() || name.len() > 253 || !name.is_ascii() {
-        bail!("invalid DNS name");
-    }
-    for label in name.split('.') {
-        if label.is_empty()
-            || label.len() > 63
-            || !label
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-            || label.starts_with('-')
-            || label.ends_with('-')
-        {
-            bail!("invalid DNS name");
-        }
-    }
-    Ok(name)
 }
 
 #[cfg(test)]

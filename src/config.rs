@@ -1,7 +1,7 @@
 //! TOML configuration and validation for the proxy, DNS relay and PCAP stream.
 
-use crate::cert::normalize_dns_name;
 use crate::dns::{points_to_self, DnsConfig};
+use crate::domain::{normalize_dns_name, DomainPattern};
 use crate::proxy::Route;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -39,7 +39,6 @@ pub struct ProxyFile {
 pub struct RouteFile {
     pub domain: String,
     pub upstream: String,
-    pub upstream_port: Option<u16>,
     #[serde(default = "default_route_verify")]
     pub verify: bool,
     pub verify_name: Option<String>,
@@ -176,16 +175,6 @@ impl RuntimeConfig {
             if !seen_routes.insert(route.pattern.clone()) {
                 bail!("duplicate route domain: {}", route.pattern);
             }
-            if item.upstream_port == Some(0) {
-                bail!("route {}: upstream_port must be nonzero", index + 1);
-            }
-            if route.port.is_some() && item.upstream_port.is_some() {
-                bail!(
-                    "route {}: specify the upstream port in upstream or upstream_port, not both",
-                    index + 1
-                );
-            }
-            route.port = route.port.or(item.upstream_port);
             if !route.tls && !item.verify {
                 bail!("route {}: verify requires a TLS upstream", index + 1);
             }
@@ -250,7 +239,7 @@ fn dns_config(file: DnsFile, resolver: SocketAddr) -> Result<DnsConfig> {
     let domains = file
         .domains
         .iter()
-        .map(|name| normalize_dns_pattern(name).context("invalid dns.domains entry"))
+        .map(|name| DomainPattern::parse(name).context("invalid dns.domains entry"))
         .collect::<Result<Vec<_>>>()?;
     if !file.all && domains.is_empty() {
         bail!("[dns] requires all = true or at least one domain");
@@ -268,16 +257,6 @@ fn dns_config(file: DnsFile, resolver: SocketAddr) -> Result<DnsConfig> {
         hijack_all: file.all,
         domains,
     })
-}
-
-fn normalize_dns_pattern(pattern: &str) -> Result<String> {
-    if pattern == "*" {
-        return Ok(pattern.to_owned());
-    }
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        return Ok(format!("*.{}", normalize_dns_name(suffix)?));
-    }
-    normalize_dns_name(pattern)
 }
 
 fn capture_config(file: CaptureFile, base: &Path) -> Result<CaptureSettings> {
@@ -368,13 +347,11 @@ default_host = 'DEFAULT.Example.'
 
 [[route]]
 domain = '*.EXAMPLE.com.'
-upstream = 'tcp://127.0.0.1'
-upstream_port = 8080
+upstream = 'tcp://127.0.0.1:8080'
 
 [[route]]
 domain = 'api.example.com'
-upstream = 'tls://backend.example.com'
-upstream_port = 443
+upstream = 'tls://backend.example.com:443'
 verify_name = 'BACKEND.example.com.'
 
 [[route]]
@@ -384,7 +361,7 @@ verify = false
 
 [[route]]
 domain = 'fallback.example.com'
-upstream = 'backend.example.com'
+upstream = 'tls://backend.example.com:8443'
 
 [dns]
 listen = '127.0.0.1:5300'
@@ -404,23 +381,29 @@ output = 'captures/current.pcap'
             Some("default.example")
         );
         assert!(config.proxy.upstream_ca.unwrap().is_absolute());
-        assert_eq!(config.routes[0].pattern, "*.example.com");
+        assert_eq!(config.routes[0].pattern.as_str(), "*.example.com");
         assert!(!config.routes[0].tls);
-        assert_eq!(config.routes[0].port, Some(8080));
+        assert_eq!(config.routes[0].port, 8080);
         assert!(config.routes[0].verify);
-        assert_eq!(config.routes[1].port, Some(443));
+        assert_eq!(config.routes[1].port, 443);
         assert!(config.routes[1].verify);
         assert_eq!(
             config.routes[1].verify_name.as_deref(),
             Some("backend.example.com")
         );
-        assert_eq!(config.routes[2].port, Some(9443));
+        assert_eq!(config.routes[2].port, 9443);
         assert!(!config.routes[2].verify);
-        assert_eq!(config.routes[3].port, None);
+        assert_eq!(config.routes[3].port, 8443);
         assert!(config.routes[3].tls);
         assert!(config.routes[3].verify);
         let dns = config.dns.unwrap();
-        assert_eq!(dns.domains, ["example.com"]);
+        assert_eq!(
+            dns.domains
+                .iter()
+                .map(DomainPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["example.com"]
+        );
         assert_eq!(dns.answer_v4, Some("192.0.2.10".parse().unwrap()));
         let capture = config.capture.unwrap();
         assert_eq!(capture.listen, Some("127.0.0.1:57012".parse().unwrap()));
@@ -456,8 +439,28 @@ output = 'captures/current.pcap'
         )
         .unwrap();
         assert_eq!(
-            config.dns.unwrap().domains,
+            config
+                .dns
+                .unwrap()
+                .domains
+                .iter()
+                .map(DomainPattern::as_str)
+                .collect::<Vec<_>>(),
             ["*.example.com", "example.com", "*"]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_normalized_route_patterns() {
+        let error = load_text(
+            "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+             [[route]]\ndomain = 'EXAMPLE.com.'\nupstream = 'tls://127.0.0.1:443'\n\
+             [[route]]\ndomain = 'example.com'\nupstream = 'tcp://127.0.0.1:80'\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("duplicate route domain: example.com"),
+            "{error:#}"
         );
     }
 
@@ -498,8 +501,8 @@ output = 'captures/current.pcap'
             "\n[capture]\nlisten = 'not-an-address'\n",
             "\n[[route]]\ndomain = 'example.com'\nupstream = 'tcp://127.0.0.1:80'\nverify_name = 'example.com'\n",
             "\n[[route]]\ndomain = 'example.com'\nupstream = 'tls://127.0.0.1:443'\nverfiy_name = 'example.com'\n",
-            "\n[[route]]\ndomain = 'example.com'\nupstream = 'tls://127.0.0.1:443'\nupstream_port = 9443\n",
-            "\n[[route]]\ndomain = 'example.com'\nupstream = 'tls://127.0.0.1'\nupstream_port = 0\n",
+            "\n[[route]]\ndomain = 'example.com'\nupstream = 'tls://127.0.0.1'\n",
+            "\n[[route]]\ndomain = 'example.com'\nupstream = 'tls://127.0.0.1:0'\n",
             "\n[[route]]\ndomain = 'example.com'\nupstream = 'tls://127.0.0.1:443'\nverify = false\nverify_name = 'example.com'\n",
             "\n[[route]]\ndomain = 'example.com'\nupstream = 'tcp://127.0.0.1:80'\nverify = false\n",
             "\n[dns]\nlisten = '127.0.0.1:53'\nip = '127.0.0.1'\nall = true\nunknwon = true\n",
@@ -508,6 +511,47 @@ output = 'captures/current.pcap'
         ] {
             assert!(load_text(&format!("{base}{bad}")).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn configured_routes_require_ports_and_accept_bracketed_ipv6() {
+        let base = "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n";
+        for upstream in [
+            "tls://backend.example.com",
+            "tcp://192.0.2.10",
+            "tls://[2001:db8::1]",
+        ] {
+            let error = load_text(&format!(
+                "{base}\n[[route]]\ndomain = 'example.com'\nupstream = '{upstream}'\n"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("upstream port is required"),
+                "{upstream}: {error:#}"
+            );
+        }
+
+        for upstream in [
+            "tls://backend.example.com:0",
+            "tcp://192.0.2.10:0",
+            "tls://[2001:db8::1]:0",
+        ] {
+            let error = load_text(&format!(
+                "{base}\n[[route]]\ndomain = 'example.com'\nupstream = '{upstream}'\n"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("upstream port must be nonzero"),
+                "{upstream}: {error:#}"
+            );
+        }
+
+        let config = load_text(&format!(
+            "{base}\n[[route]]\ndomain = 'example.com'\nupstream = 'tls://[2001:db8::1]:443'\n"
+        ))
+        .unwrap();
+        assert_eq!(config.routes[0].host, "2001:db8::1");
+        assert_eq!(config.routes[0].port, 443);
     }
 
     #[test]
