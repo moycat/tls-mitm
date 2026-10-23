@@ -16,9 +16,8 @@ config.toml
 config.local.toml
 config.*.local.toml
 *.crt
-*.crt.pem
 *.key
-*.key.pem
+*.pem
 *.p12
 *.pfx
 
