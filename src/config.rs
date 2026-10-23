@@ -5,7 +5,7 @@ use crate::domain::{normalize_dns_name, DomainPattern};
 use crate::proxy::Route;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -249,6 +249,23 @@ impl RuntimeConfig {
             routes.push(route);
         }
 
+        let mut proxy_domain_groups = HashMap::new();
+        register_domain_group(
+            &mut proxy_domain_groups,
+            "proxy.hold_domains",
+            proxy.hold_domains.iter(),
+        )?;
+        register_domain_group(
+            &mut proxy_domain_groups,
+            "proxy.exclude_domains",
+            proxy.exclude_domains.iter(),
+        )?;
+        register_domain_group(
+            &mut proxy_domain_groups,
+            "route.domain",
+            routes.iter().map(|route| &route.pattern),
+        )?;
+
         let dns = file
             .dns
             .map(|item| dns_config(item, resolver))
@@ -293,6 +310,13 @@ fn dns_config(file: DnsFile, resolver: SocketAddr) -> Result<DnsConfig> {
     }
     let domains = parse_domain_patterns(&file.domains, "dns.domains")?;
     let exclude_domains = parse_domain_patterns(&file.exclude_domains, "dns.exclude_domains")?;
+    let mut dns_domain_groups = HashMap::new();
+    register_domain_group(&mut dns_domain_groups, "dns.domains", domains.iter())?;
+    register_domain_group(
+        &mut dns_domain_groups,
+        "dns.exclude_domains",
+        exclude_domains.iter(),
+    )?;
     if !file.all && domains.is_empty() {
         bail!("[dns] requires all = true or at least one domain");
     }
@@ -317,6 +341,21 @@ fn parse_domain_patterns(values: &[String], field: &str) -> Result<Vec<DomainPat
         .into_iter()
         .filter(|pattern| seen.insert(pattern.clone()))
         .collect())
+}
+
+fn register_domain_group<'a>(
+    seen: &mut HashMap<DomainPattern, &'static str>,
+    group: &'static str,
+    patterns: impl IntoIterator<Item = &'a DomainPattern>,
+) -> Result<()> {
+    for pattern in patterns {
+        if let Some(previous) = seen.insert(pattern.clone(), group) {
+            if previous != group {
+                bail!("domain pattern {pattern} appears in both {previous} and {group}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn capture_config(file: CaptureFile, base: &Path) -> Result<CaptureSettings> {
@@ -556,7 +595,7 @@ output = 'captures/current.pcap'
              [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\n\
              all = true\n\
              domains = ['*.EXAMPLE.com.', '*.example.com', 'example.com', '*']\n\
-             exclude_domains = ['EXCLUDED.example.', 'excluded.example', '*.SKIP.example.', '*']\n",
+             exclude_domains = ['EXCLUDED.example.', 'excluded.example', '*.SKIP.example.']\n",
         )
         .unwrap();
         let dns = config.dns.unwrap();
@@ -572,7 +611,7 @@ output = 'captures/current.pcap'
                 .iter()
                 .map(DomainPattern::as_str)
                 .collect::<Vec<_>>(),
-            ["excluded.example", "*.skip.example", "*"]
+            ["excluded.example", "*.skip.example"]
         );
     }
 
@@ -653,6 +692,87 @@ output = 'captures/current.pcap'
         assert!(
             format!("{error:#}").contains("duplicate route domain: example.com"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_normalized_patterns_shared_by_proxy_groups() {
+        let cases = [
+            (
+                "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+                 hold_domains = ['EXAMPLE.com.']\nexclude_domains = ['example.com']\n",
+                "proxy.hold_domains and proxy.exclude_domains",
+            ),
+            (
+                "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+                 hold_domains = ['*.EXAMPLE.com.']\n\
+                 [[route]]\ndomain = '*.example.com'\nupstream = 'tls://127.0.0.1:443'\n",
+                "proxy.hold_domains and route.domain",
+            ),
+            (
+                "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+                 exclude_domains = ['EXAMPLE.com.']\n\
+                 [[route]]\ndomain = 'example.com'\nupstream = 'tls://127.0.0.1:443'\n",
+                "proxy.exclude_domains and route.domain",
+            ),
+            (
+                "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+                 hold_domains = ['*']\n\
+                 [[route]]\ndomain = '*'\nupstream = 'tls://127.0.0.1:443'\n",
+                "proxy.hold_domains and route.domain",
+            ),
+        ];
+
+        for (text, groups) in cases {
+            let error = load_text(text).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("domain pattern") && message.contains(groups),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_normalized_patterns_shared_by_dns_groups() {
+        for (domain, exclusion, normalized) in [
+            ("*.EXAMPLE.com.", "*.example.com", "*.example.com"),
+            ("*", "*", "*"),
+        ] {
+            let error = load_text(&format!(
+                "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+                 [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\nall = true\n\
+                 domains = ['{domain}']\nexclude_domains = ['{exclusion}']\n"
+            ))
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!(
+                    "domain pattern {normalized} appears in both dns.domains and dns.exclude_domains"
+                )),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_overlapping_distinct_patterns_and_proxy_dns_reuse() {
+        let config = load_text(
+            "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+             hold_domains = ['example.com']\n\
+             exclude_domains = ['*.example.com', 'shared.example']\n\
+             [[route]]\ndomain = 'api.example.com'\nupstream = 'tls://127.0.0.1:443'\n\
+             [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\nall = true\n\
+             domains = ['example.com']\n\
+             exclude_domains = ['*.example.com', 'shared.example']\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.routes[0].pattern.as_str(), "api.example.com");
+        assert_eq!(config.proxy.exclude_domains[1].as_str(), "shared.example");
+        assert_eq!(
+            config.dns.unwrap().exclude_domains[1].as_str(),
+            "shared.example"
         );
     }
 

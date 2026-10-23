@@ -5,14 +5,16 @@ ca_key = "certs/test.key.pem"
 listen = ["127.0.0.1:443"]
 upstream_port = 443
 resolver = "1.1.1.1:53"
-# Matching actual SNI values are held after ClientHello without any reply or
-# upstream connection. Held sockets remain open until the client disconnects,
-# including across configuration reloads, and take precedence over exclusions
-# and routes.
+# Proxy hold, exclusion, and route rules compete by domain specificity: the
+# longest fixed suffix wins, then a plain domain wins over *.domain for the
+# same base. The same normalized pattern cannot appear in different groups.
+# When a hold rule wins, the actual-SNI connection is held after ClientHello
+# without a reply or upstream connection. It remains held across reloads until
+# the client disconnects.
 hold_domains = ["hold.example.test"]
-# Matching actual SNI values bypass MITM and every route. The original TLS
-# stream goes to that SNI through resolver on upstream_port (or the listener
-# port when upstream_port is omitted), and is not included in decrypted PCAP.
+# When an exclusion rule wins, the original TLS stream goes to the actual SNI
+# through resolver on upstream_port (or the listener port when omitted),
+# bypassing MITM and decrypted PCAP capture.
 exclude_domains = ["connectivitycheck.gstatic.com", "*.updates.example"]
 
 # Example routes use reserved test names; replace them with your own targets.
@@ -28,8 +30,8 @@ upstream = "tcp://127.0.0.1:8080" # Send decrypted bytes to a plain TCP service.
 
 # For a TLS route with verify = true (the default), you may instead set
 # verify_name = "backend.example.test" to verify a different certificate name.
-# A route with domain = "*" is a catch-all fallback after exact and *.suffix
-# routes. default_host and verify_name must be concrete DNS names.
+# A route with domain = "*" is the least-specific catch-all. default_host and
+# verify_name must be concrete DNS names.
 
 # To direct a test device's DNS to this host, supply an IP reachable from it.
 # [dns]
@@ -37,8 +39,10 @@ upstream = "tcp://127.0.0.1:8080" # Send decrypted bytes to a plain TCP service.
 # ip = "192.0.2.10"
 # all = true
 # exclude_domains = ["connectivitycheck.gstatic.com", "*.updates.example"]
-# Used only when all = true; matching follows the same rules as domains.
-# domains = ["example.com", "*.lab.example.net"] # Used when all = false.
+# domains = ["example.com", "*.lab.example.net"]
+# domains and exclude_domains compete in both modes using the same specificity
+# rules as proxy entries. all is only the fallback when neither list matches.
+# The same normalized pattern cannot appear in both DNS lists.
 # "example.com" includes the apex and its subdomains; "*.lab.example.net"
 # includes subdomains only. "*" matches every name. Matching ignores case.
 # Partial-label wildcards such as "api*.example.com" are invalid.

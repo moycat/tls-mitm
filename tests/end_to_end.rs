@@ -580,12 +580,13 @@ async fn exercise_tls_passthrough() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     });
 
-    // A matching route deliberately points elsewhere. The exclusion must win
-    // and use NAME plus default_upstream_port as the real upstream instead.
+    // A broader matching route deliberately points elsewhere. The more
+    // specific concrete exclusion must win and use NAME plus
+    // default_upstream_port as the real upstream instead.
     let route_trap = std::net::TcpListener::bind("127.0.0.1:0")?;
     route_trap.set_nonblocking(true)?;
     let route = Route::parse(&format!(
-        "{NAME}=tcp://127.0.0.1:{}",
+        "*.skip.example=tcp://127.0.0.1:{}",
         route_trap.local_addr()?.port()
     ))?;
     let proxy = Proxy::bind(ProxyConfig {
@@ -595,7 +596,7 @@ async fn exercise_tls_passthrough() -> Result<()> {
         ca: proxy_ca,
         routes: vec![route],
         hold_domains: Vec::new(),
-        exclude_domains: vec![DomainPattern::parse("*.skip.example")?],
+        exclude_domains: vec![DomainPattern::parse(NAME)?],
         default_host: None,
         upstream_client: build_upstream_client(None)?,
         capture: None,
@@ -664,7 +665,10 @@ async fn exercise_held_proxy_domain() -> Result<()> {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
     let upstream_addr = upstream_listener.local_addr()?;
     let resolver = UdpSocket::bind("127.0.0.1:0").await?;
-    let route = Route::parse(&format!("{NAME}=tcp://127.0.0.1:{}", upstream_addr.port()))?;
+    let route = Route::parse(&format!(
+        "*.example=tcp://127.0.0.1:{}",
+        upstream_addr.port()
+    ))?;
     let listen = "127.0.0.1:0".parse()?;
     let proxy = Proxy::bind(ProxyConfig {
         listen,
@@ -673,7 +677,7 @@ async fn exercise_held_proxy_domain() -> Result<()> {
         ca: ca.clone(),
         routes: vec![route.clone()],
         hold_domains: vec![DomainPattern::parse(NAME)?],
-        exclude_domains: vec![DomainPattern::parse(NAME)?],
+        exclude_domains: vec![DomainPattern::parse("example")?],
         default_host: None,
         upstream_client: upstream_client.clone(),
         capture: None,
@@ -953,7 +957,7 @@ async fn exercise_setup_phase_reload_cancellation() -> Result<()> {
     let resolver = UdpSocket::bind("127.0.0.1:0").await?;
 
     let route = Route::parse(&format!(
-        "{NAME}=tcp://127.0.0.1:{}",
+        "*.reload.example=tcp://127.0.0.1:{}",
         real_upstream.local_addr()?.port()
     ))?;
     let listen = "127.0.0.1:0".parse()?;

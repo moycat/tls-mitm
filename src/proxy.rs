@@ -159,6 +159,54 @@ fn select_route<'a>(routes: &'a [Route], name: &str) -> Option<&'a Route> {
         .max_by_key(|route| route.pattern.specificity())
 }
 
+#[derive(Clone, Copy)]
+enum MatchedPolicy<'a> {
+    Hold(&'a DomainPattern),
+    Passthrough(&'a DomainPattern),
+    Route(&'a Route),
+}
+
+impl MatchedPolicy<'_> {
+    fn pattern(&self) -> &DomainPattern {
+        match self {
+            Self::Hold(pattern) | Self::Passthrough(pattern) => pattern,
+            Self::Route(route) => &route.pattern,
+        }
+    }
+}
+
+fn select_policy<'a>(
+    config: &'a ProxyConfig,
+    name: &str,
+    has_client_sni: bool,
+) -> Option<MatchedPolicy<'a>> {
+    let mut selected = select_route(&config.routes, name).map(MatchedPolicy::Route);
+    if !has_client_sni {
+        return selected;
+    }
+
+    for candidate in config
+        .hold_domains
+        .iter()
+        .filter(|pattern| pattern.matches_normalized_name(name))
+        .map(MatchedPolicy::Hold)
+        .chain(
+            config
+                .exclude_domains
+                .iter()
+                .filter(|pattern| pattern.matches_normalized_name(name))
+                .map(MatchedPolicy::Passthrough),
+        )
+    {
+        if selected.as_ref().is_none_or(|current| {
+            candidate.pattern().specificity() > current.pattern().specificity()
+        }) {
+            selected = Some(candidate);
+        }
+    }
+    selected
+}
+
 fn format_upstream_uri(tls: bool, host: &str, port: u16) -> String {
     let scheme = if tls { "tls" } else { "tcp" };
     if matches!(host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
@@ -522,45 +570,31 @@ fn connection_plan(config: &ProxyConfig, client_sni: Option<&str>) -> Result<Con
             anyhow!("TLS ClientHello has no SNI; set proxy.default_host for this client")
         })?;
 
-    if client_sni.is_some()
-        && config
-            .hold_domains
-            .iter()
-            .any(|pattern| pattern.matches_normalized_name(&name))
-    {
-        return Ok(ConnectionPlan::Hold { name });
-    }
-
-    if client_sni.is_some()
-        && config
-            .exclude_domains
-            .iter()
-            .any(|pattern| pattern.matches_normalized_name(&name))
-    {
-        return Ok(ConnectionPlan::Passthrough {
-            name,
-            port: config.default_upstream_port,
-            resolver: Some(config.resolver),
-        });
-    }
-
-    let route = select_route(&config.routes, &name);
-    let (target_host, target_port, target_tls, verify, verify_name) = match route {
-        Some(route) => (
-            route.host.clone(),
-            route.port,
-            route.tls,
-            route.verify,
-            route.verify_name.clone().unwrap_or_else(|| name.clone()),
-        ),
-        None => (
-            name.clone(),
-            config.default_upstream_port,
-            true,
-            true,
-            name.clone(),
-        ),
-    };
+    let (target_host, target_port, target_tls, verify, verify_name) =
+        match select_policy(config, &name, client_sni.is_some()) {
+            Some(MatchedPolicy::Hold(_)) => return Ok(ConnectionPlan::Hold { name }),
+            Some(MatchedPolicy::Passthrough(_)) => {
+                return Ok(ConnectionPlan::Passthrough {
+                    name,
+                    port: config.default_upstream_port,
+                    resolver: Some(config.resolver),
+                });
+            }
+            Some(MatchedPolicy::Route(route)) => (
+                route.host.clone(),
+                route.port,
+                route.tls,
+                route.verify,
+                route.verify_name.clone().unwrap_or_else(|| name.clone()),
+            ),
+            None => (
+                name.clone(),
+                config.default_upstream_port,
+                true,
+                true,
+                name.clone(),
+            ),
+        };
     let resolver = target_host
         .parse::<IpAddr>()
         .is_err()
@@ -1029,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn route_selection_prefers_exact_then_narrowest_pattern_then_catch_all() {
+    fn route_selection_prefers_longest_suffix_then_plain_pattern_then_catch_all() {
         let routes = vec![
             Route::parse("a.example.com=tcp://127.0.0.1:8001").unwrap(),
             Route::parse("*.example.com=tcp://127.0.0.1:8002").unwrap(),
@@ -1037,7 +1071,7 @@ mod tests {
             Route::parse("example.com=tcp://127.0.0.1:8004").unwrap(),
         ];
         assert_eq!(select_route(&routes, "a.example.com").unwrap().port, 8001);
-        assert_eq!(select_route(&routes, "b.example.com").unwrap().port, 8002);
+        assert_eq!(select_route(&routes, "b.example.com").unwrap().port, 8004);
         assert_eq!(select_route(&routes, "example.com").unwrap().port, 8004);
         assert_eq!(
             select_route(&routes, "deep.a.example.com").unwrap().port,
@@ -1094,11 +1128,11 @@ mod tests {
     }
 
     #[test]
-    fn proxy_exclusion_uses_actual_sni_and_overrides_routes() {
+    fn proxy_exclusion_uses_actual_sni_and_beats_a_less_specific_route() {
         let mut config = test_config();
         config.default_host = Some("excluded.example".to_owned());
         config.exclude_domains = vec![DomainPattern::parse("excluded.example").unwrap()];
-        config.routes = vec![Route::parse("excluded.example=tcp://127.0.0.1:8080").unwrap()];
+        config.routes = vec![Route::parse("*=tcp://127.0.0.1:8080").unwrap()];
 
         assert!(matches!(
             connection_plan(&config, Some("excluded.example")).unwrap(),
@@ -1119,12 +1153,12 @@ mod tests {
     }
 
     #[test]
-    fn proxy_hold_uses_actual_sni_and_overrides_exclusion_and_routes() {
+    fn proxy_hold_uses_actual_sni_and_beats_less_specific_policies() {
         let mut config = test_config();
         config.default_host = Some("held.example".to_owned());
         config.hold_domains = vec![DomainPattern::parse("held.example").unwrap()];
-        config.exclude_domains = vec![DomainPattern::parse("held.example").unwrap()];
-        config.routes = vec![Route::parse("held.example=tcp://127.0.0.1:8080").unwrap()];
+        config.exclude_domains = vec![DomainPattern::parse("*.held.example").unwrap()];
+        config.routes = vec![Route::parse("*=tcp://127.0.0.1:8080").unwrap()];
 
         assert!(matches!(
             connection_plan(&config, Some("held.example")).unwrap(),
@@ -1136,6 +1170,52 @@ mod tests {
         ));
         assert!(matches!(
             connection_plan(&config, None).unwrap(),
+            ConnectionPlan::Intercept {
+                target_port: 8080,
+                target_tls: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn proxy_route_beats_less_specific_hold_and_exclusion_patterns() {
+        let mut config = test_config();
+        config.hold_domains = vec![DomainPattern::parse("*").unwrap()];
+        config.exclude_domains = vec![DomainPattern::parse("*.example").unwrap()];
+        config.routes = vec![Route::parse("routed.example=tcp://127.0.0.1:8080").unwrap()];
+
+        assert!(matches!(
+            connection_plan(&config, Some("routed.example")).unwrap(),
+            ConnectionPlan::Intercept {
+                target_port: 8080,
+                target_tls: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn proxy_exclusion_beats_less_specific_hold_and_route_patterns() {
+        let mut config = test_config();
+        config.hold_domains = vec![DomainPattern::parse("*").unwrap()];
+        config.exclude_domains = vec![DomainPattern::parse("passthrough.example").unwrap()];
+        config.routes = vec![Route::parse("*.example=tcp://127.0.0.1:8080").unwrap()];
+
+        assert!(matches!(
+            connection_plan(&config, Some("passthrough.example")).unwrap(),
+            ConnectionPlan::Passthrough { name, .. } if name == "passthrough.example"
+        ));
+    }
+
+    #[test]
+    fn proxy_longer_wildcard_beats_a_shorter_plain_pattern() {
+        let mut config = test_config();
+        config.hold_domains = vec![DomainPattern::parse("example.com").unwrap()];
+        config.routes = vec![Route::parse("*.api.example.com=tcp://127.0.0.1:8080").unwrap()];
+
+        assert!(matches!(
+            connection_plan(&config, Some("host.api.example.com")).unwrap(),
             ConnectionPlan::Intercept {
                 target_port: 8080,
                 target_tls: false,

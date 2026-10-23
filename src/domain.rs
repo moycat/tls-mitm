@@ -80,7 +80,10 @@ impl DomainPattern {
     }
 
     pub(crate) fn specificity(&self) -> (usize, bool) {
-        (self.label_count, self.kind == MatchKind::SubdomainsOnly)
+        (
+            self.label_count,
+            self.kind == MatchKind::DomainAndSubdomains,
+        )
     }
 
     fn matches_labels<'a, I>(&self, labels: I) -> bool
@@ -162,5 +165,17 @@ mod tests {
         ] {
             assert!(DomainPattern::parse(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn specificity_prefers_narrower_then_plain_patterns() {
+        let catch_all = DomainPattern::parse("*").unwrap();
+        let broad_plain = DomainPattern::parse("example.com").unwrap();
+        let broad_wildcard = DomainPattern::parse("*.example.com").unwrap();
+        let narrow_wildcard = DomainPattern::parse("*.internal.example.com").unwrap();
+
+        assert!(broad_plain.specificity() > broad_wildcard.specificity());
+        assert!(narrow_wildcard.specificity() > broad_plain.specificity());
+        assert!(broad_wildcard.specificity() > catch_all.specificity());
     }
 }

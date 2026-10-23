@@ -38,8 +38,8 @@ pub struct DnsConfig {
     /// A plain name matches itself and its subdomains; `*.name` matches only
     /// subdomains, and `*` matches every name.
     pub domains: Vec<DomainPattern>,
-    /// Names that remain on the upstream resolver when `hijack_all` is set.
-    /// These patterns use the same matching rules as `domains`.
+    /// Explicit forwarding rules that compete with `domains` in both modes.
+    /// These patterns use the same precedence rules as `domains`.
     pub exclude_domains: Vec<DomainPattern>,
 }
 
@@ -433,16 +433,23 @@ fn classify_query(query: &[u8], config: &DnsConfig) -> QueryAction {
 }
 
 fn matches_domain(labels: &[Vec<u8>], config: &DnsConfig) -> bool {
-    if config.hijack_all {
-        return !config
-            .exclude_domains
-            .iter()
-            .any(|pattern| pattern.matches_wire_labels(labels));
-    }
-    config
+    let included = config
         .domains
         .iter()
-        .any(|pattern| pattern.matches_wire_labels(labels))
+        .filter(|pattern| pattern.matches_wire_labels(labels))
+        .max_by_key(|pattern| pattern.specificity());
+    let excluded = config
+        .exclude_domains
+        .iter()
+        .filter(|pattern| pattern.matches_wire_labels(labels))
+        .max_by_key(|pattern| pattern.specificity());
+
+    match (included, excluded) {
+        (Some(included), Some(excluded)) => included.specificity() > excluded.specificity(),
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => config.hijack_all,
+    }
 }
 
 fn parse_question(message: &[u8]) -> Option<Question> {
@@ -1070,6 +1077,7 @@ mod tests {
     fn all_mode_excludes_domains_with_normal_matching_rules() {
         let mut cfg = config();
         cfg.hijack_all = true;
+        cfg.domains.clear();
         cfg.exclude_domains = vec![
             DomainPattern::parse("Example.COM.").unwrap(),
             DomainPattern::parse("*.wild.example").unwrap(),
@@ -1100,6 +1108,7 @@ mod tests {
 
         cfg.hijack_all = false;
         cfg.domains = vec![DomainPattern::parse("example.com").unwrap()];
+        cfg.exclude_domains.clear();
         assert!(matches!(
             classify_query(&query("example.com", 1), &cfg),
             QueryAction::Hijack { .. }
@@ -1110,11 +1119,94 @@ mod tests {
     fn star_exclusion_forwards_every_name_in_all_mode() {
         let mut cfg = config();
         cfg.hijack_all = true;
+        cfg.domains.clear();
         cfg.exclude_domains = vec![DomainPattern::parse("*").unwrap()];
         for name in ["example.com", "other.test", "a.b.example.org"] {
             assert!(matches!(
                 classify_query(&query(name, 1), &cfg),
                 QueryAction::Forward(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn domain_groups_compete_by_specificity_in_both_modes() {
+        for hijack_all in [false, true] {
+            let mut cfg = config();
+            cfg.hijack_all = hijack_all;
+            cfg.domains = vec![DomainPattern::parse("api.example.com").unwrap()];
+            cfg.exclude_domains = vec![DomainPattern::parse("*.example.com").unwrap()];
+
+            assert!(matches!(
+                classify_query(&query("api.example.com", 1), &cfg),
+                QueryAction::Hijack { .. }
+            ));
+            assert!(matches!(
+                classify_query(&query("deep.api.example.com", 1), &cfg),
+                QueryAction::Hijack { .. }
+            ));
+            assert!(matches!(
+                classify_query(&query("other.example.com", 1), &cfg),
+                QueryAction::Forward(_)
+            ));
+            assert_eq!(
+                matches!(
+                    classify_query(&query("unmatched.test", 1), &cfg),
+                    QueryAction::Hijack { .. }
+                ),
+                hijack_all
+            );
+
+            std::mem::swap(&mut cfg.domains, &mut cfg.exclude_domains);
+            assert!(matches!(
+                classify_query(&query("api.example.com", 1), &cfg),
+                QueryAction::Forward(_)
+            ));
+            assert!(matches!(
+                classify_query(&query("other.example.com", 1), &cfg),
+                QueryAction::Hijack { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn plain_pattern_beats_same_base_wildcard_in_both_modes() {
+        for hijack_all in [false, true] {
+            let mut cfg = config();
+            cfg.hijack_all = hijack_all;
+            cfg.domains = vec![DomainPattern::parse("example.com").unwrap()];
+            cfg.exclude_domains = vec![DomainPattern::parse("*.example.com").unwrap()];
+
+            assert!(matches!(
+                classify_query(&query("host.example.com", 1), &cfg),
+                QueryAction::Hijack { .. }
+            ));
+
+            std::mem::swap(&mut cfg.domains, &mut cfg.exclude_domains);
+            assert!(matches!(
+                classify_query(&query("host.example.com", 1), &cfg),
+                QueryAction::Forward(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn deeper_wildcard_beats_broader_plain_pattern_in_both_modes() {
+        for hijack_all in [false, true] {
+            let mut cfg = config();
+            cfg.hijack_all = hijack_all;
+            cfg.domains = vec![DomainPattern::parse("example.com").unwrap()];
+            cfg.exclude_domains = vec![DomainPattern::parse("*.api.example.com").unwrap()];
+
+            assert!(matches!(
+                classify_query(&query("host.api.example.com", 1), &cfg),
+                QueryAction::Forward(_)
+            ));
+
+            std::mem::swap(&mut cfg.domains, &mut cfg.exclude_domains);
+            assert!(matches!(
+                classify_query(&query("host.api.example.com", 1), &cfg),
+                QueryAction::Hijack { .. }
             ));
         }
     }
