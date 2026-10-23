@@ -58,6 +58,42 @@ curl --cacert example/certs/test.crt.pem \
 
 `proxy.listen` accepts multiple addresses, such as `["0.0.0.0:443", "0.0.0.0:993"]`. Without `proxy.upstream_port`, each listener connects to the same port on the real upstream.
 
+### Hold selected TLS domains open
+
+Set `proxy.hold_domains` to accept matching connections and read their TLS ClientHello without sending a reply, connecting upstream, or closing the connection:
+
+```toml
+[proxy]
+ca_cert = "example/certs/test.crt.pem"
+ca_key = "example/certs/test.key.pem"
+listen = ["0.0.0.0:443"]
+hold_domains = ["telemetry.example.com", "*.blocked.example"]
+```
+
+The list is matched against the actual SNI and uses the same domain rules as `dns.domains`: a plain name includes that name and its subdomains, `*.example.com` includes subdomains at any depth but not the apex, and `"*"` matches every SNI. Matching is case-insensitive, partial-label wildcards are invalid, and `proxy.default_host` is not used for this decision.
+
+A hold match takes precedence over `proxy.exclude_domains` and every `[[route]]`. After receiving the ClientHello, the proxy sends no bytes and keeps the socket open until the client disconnects. It does not connect to an upstream, generate a certificate, decrypt traffic, or include the connection in decrypted PCAP capture. A later configuration reload does not close an already-held connection, even if its SNI is removed from `hold_domains`. New connections use the reloaded list; existing non-held connections still follow the normal effective-policy invalidation rules.
+
+### Pass selected TLS domains through
+
+Set `proxy.exclude_domains` to leave matching TLS connections encrypted instead of intercepting them:
+
+```toml
+[proxy]
+ca_cert = "example/certs/test.crt.pem"
+ca_key = "example/certs/test.key.pem"
+listen = ["0.0.0.0:443"]
+upstream_port = 443
+resolver = "1.1.1.1:53"
+exclude_domains = ["connectivitycheck.gstatic.com", "*.updates.example"]
+```
+
+The list is matched against the actual SNI in the client's TLS ClientHello; `proxy.default_host` is not used for exclusion matching. Entries use the same rules as `dns.domains`: a plain name includes that name and its subdomains, `*.example.com` includes subdomains at any depth but not the apex, and `"*"` matches every SNI. Matching is case-insensitive, and partial-label wildcards are invalid.
+
+A matching SNI takes precedence over every `[[route]]`. The proxy resolves that SNI through `proxy.resolver`, connects to `proxy.upstream_port` or, when it is omitted, the port of the proxy listener that accepted the connection, and forwards the original TLS stream unchanged. It does not generate a leaf certificate, decrypt the connection, apply route TLS settings, or include that connection in decrypted PCAP capture.
+
+`proxy.exclude_domains` controls TLS interception only. `dns.exclude_domains` separately controls DNS rewriting, so configure both lists when a domain must bypass both mechanisms.
+
 ### Route selected domains
 
 Add one or more `[[route]]` entries:
@@ -97,11 +133,22 @@ resolver = "1.1.1.1:53"
 listen = "0.0.0.0:53"
 ip = "192.0.2.10"
 all = true
+exclude_domains = ["connectivitycheck.gstatic.com", "*.updates.example"]
 ```
 
 To select names for DNS rewriting, set `all = false` and add `domains = ["example.com", "*.example.net"]`. `example.com` matches both the apex name and its subdomains; `*.example.net` matches subdomains at any depth but not `example.net` itself. A domain entry of `"*"` matches every name. Matching is case-insensitive. Wildcards must be the entire entry or a leading `*.`; partial-label forms such as `api*.example.com` are invalid.
 
+When `all = true`, `dns.exclude_domains` leaves matching names unchanged and forwards their queries to `proxy.resolver`. It uses the same matching rules as `domains`; it has no effect when `all = false`. This setting controls DNS rewriting only and is independent of `proxy.exclude_domains`, which controls TLS interception.
+
 To answer AAAA queries, set `ip6` to a reachable local IPv6 address. The DNS service handles both UDP and TCP. It returns the configured address for rewritten A and AAAA queries, or an empty answer when that address family is not configured. For rewritten domains it also returns empty CNAME, DNAME, SVCB, HTTPS, and ANY answers, so those records cannot direct the client toward an alias, HTTP/3, or ECH. Other record types are forwarded to `proxy.resolver`. Do not point `proxy.resolver` at this tool's DNS listener.
+
+### Reload configuration automatically
+
+The process monitors the selected configuration file and automatically reloads a valid change without restarting. New connections and DNS queries use the new configuration. Existing TLS connections remain open when their effective policy is unchanged; a successful reload closes only connections whose effective route, interception, or passthrough policy changed. Connections already matched by `proxy.hold_domains` remain held until the client disconnects, even if a later reload changes that list.
+
+If a changed file cannot be read, parsed, validated, or prepared, the process logs an error, keeps the last valid configuration, and continues running. An invalid change does not close existing connections.
+
+Listening topology cannot be changed by a reload. The set of `proxy.listen` addresses must remain the same, and the `[dns]` section cannot be added or removed or change `dns.listen`. The entire `[capture]` configuration is also fixed for the lifetime of the process. A change to any of these settings is rejected as a whole, with the previous configuration and listeners left in place; restart the process to apply it.
 
 ### View decrypted traffic in Wireshark
 

@@ -32,6 +32,10 @@ pub struct ProxyFile {
     pub resolver: String,
     pub upstream_ca: Option<PathBuf>,
     pub default_host: Option<String>,
+    #[serde(default)]
+    pub exclude_domains: Vec<String>,
+    #[serde(default)]
+    pub hold_domains: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +58,8 @@ pub struct DnsFile {
     pub all: bool,
     #[serde(default)]
     pub domains: Vec<String>,
+    #[serde(default)]
+    pub exclude_domains: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,7 +70,7 @@ pub struct CaptureFile {
     pub output: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub proxy: ProxySettings,
     pub routes: Vec<Route>,
@@ -72,7 +78,7 @@ pub struct RuntimeConfig {
     pub capture: Option<CaptureSettings>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxySettings {
     pub ca_cert: PathBuf,
     pub ca_key: PathBuf,
@@ -81,9 +87,11 @@ pub struct ProxySettings {
     pub resolver: SocketAddr,
     pub upstream_ca: Option<PathBuf>,
     pub default_host: Option<String>,
+    pub exclude_domains: Vec<DomainPattern>,
+    pub hold_domains: Vec<DomainPattern>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureSettings {
     pub listen: Option<SocketAddr>,
     pub map_port: Option<u16>,
@@ -105,11 +113,53 @@ fn default_route_verify() -> bool {
 /// Read and validate a TOML file. Relative certificate paths are rooted at
 /// the config file's directory, regardless of the process working directory.
 pub fn load(path: &Path) -> Result<RuntimeConfig> {
-    let path =
-        fs::canonicalize(path).with_context(|| format!("find config file {}", path.display()))?;
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("read config file {}", path.display()))?;
-    let file: FileConfig = toml::from_str(&contents)
+    load_snapshot(path).map(|(config, _)| config)
+}
+
+/// Read and validate a TOML file, returning the exact bytes used to build the
+/// runtime configuration. This lets reload callers verify that the file did
+/// not change while a candidate configuration was being prepared.
+pub fn load_snapshot(path: &Path) -> Result<(RuntimeConfig, Vec<u8>)> {
+    let path = canonical_config_path(path)?;
+    let contents =
+        fs::read(&path).with_context(|| format!("read config file {}", path.display()))?;
+    let config = parse_contents(&path, &contents)?;
+    Ok((config, contents))
+}
+
+/// Parse and validate exact TOML bytes using the canonical config file's
+/// directory as the base for relative paths.
+pub fn load_contents(path: &Path, contents: &[u8]) -> Result<RuntimeConfig> {
+    let path = config_path_for_contents(path)?;
+    parse_contents(&path, contents)
+}
+
+fn canonical_config_path(path: &Path) -> Result<PathBuf> {
+    fs::canonicalize(path).with_context(|| format!("find config file {}", path.display()))
+}
+
+fn config_path_for_contents(path: &Path) -> Result<PathBuf> {
+    if let Ok(path) = fs::canonicalize(path) {
+        return Ok(path);
+    }
+    let file_name = path
+        .file_name()
+        .context("config file path has no file name")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => fs::canonicalize(parent)
+            .with_context(|| format!("find config directory {}", parent.display()))?,
+        None => std::env::current_dir().context("read current directory")?,
+    };
+    Ok(parent.join(file_name))
+}
+
+fn parse_contents(path: &Path, contents: &[u8]) -> Result<RuntimeConfig> {
+    let contents = std::str::from_utf8(contents)
+        .with_context(|| format!("decode config file {} as UTF-8", path.display()))?;
+    let file: FileConfig = toml::from_str(contents)
         .with_context(|| format!("parse config file {}", path.display()))?;
     let base = path
         .parent()
@@ -157,6 +207,9 @@ impl RuntimeConfig {
             .as_deref()
             .map(|name| normalize_dns_name(name).context("invalid proxy.default_host"))
             .transpose()?;
+        let exclude_domains =
+            parse_domain_patterns(&proxy.exclude_domains, "proxy.exclude_domains")?;
+        let hold_domains = parse_domain_patterns(&proxy.hold_domains, "proxy.hold_domains")?;
         let proxy = ProxySettings {
             ca_cert: relative_to(base, proxy.ca_cert),
             ca_key: relative_to(base, proxy.ca_key),
@@ -165,6 +218,8 @@ impl RuntimeConfig {
             resolver,
             upstream_ca: proxy.upstream_ca.map(|path| relative_to(base, path)),
             default_host,
+            exclude_domains,
+            hold_domains,
         };
 
         let mut seen_routes = HashSet::new();
@@ -236,19 +291,11 @@ fn dns_config(file: DnsFile, resolver: SocketAddr) -> Result<DnsConfig> {
     if answer_v4.is_none() && answer_v6.is_none() {
         bail!("[dns] requires ip or ip6");
     }
-    let domains = file
-        .domains
-        .iter()
-        .map(|name| DomainPattern::parse(name).context("invalid dns.domains entry"))
-        .collect::<Result<Vec<_>>>()?;
+    let domains = parse_domain_patterns(&file.domains, "dns.domains")?;
+    let exclude_domains = parse_domain_patterns(&file.exclude_domains, "dns.exclude_domains")?;
     if !file.all && domains.is_empty() {
         bail!("[dns] requires all = true or at least one domain");
     }
-    let mut seen = HashSet::new();
-    let domains = domains
-        .into_iter()
-        .filter(|domain| seen.insert(domain.clone()))
-        .collect();
     Ok(DnsConfig {
         bind,
         upstream: resolver,
@@ -256,7 +303,20 @@ fn dns_config(file: DnsFile, resolver: SocketAddr) -> Result<DnsConfig> {
         answer_v6,
         hijack_all: file.all,
         domains,
+        exclude_domains,
     })
+}
+
+fn parse_domain_patterns(values: &[String], field: &str) -> Result<Vec<DomainPattern>> {
+    let patterns = values
+        .iter()
+        .map(|name| DomainPattern::parse(name).with_context(|| format!("invalid {field} entry")))
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    Ok(patterns
+        .into_iter()
+        .filter(|pattern| seen.insert(pattern.clone()))
+        .collect())
 }
 
 fn capture_config(file: CaptureFile, base: &Path) -> Result<CaptureSettings> {
@@ -329,9 +389,67 @@ mod tests {
         assert_eq!(config.proxy.ca_key, base.join("certs/key.pem"));
         assert_eq!(config.proxy.listen, ["127.0.0.1:8443".parse().unwrap()]);
         assert_eq!(config.proxy.resolver, "1.1.1.1:53".parse().unwrap());
+        assert!(config.proxy.exclude_domains.is_empty());
+        assert!(config.proxy.hold_domains.is_empty());
         assert!(config.routes.is_empty());
         assert!(config.dns.is_none());
         assert!(config.capture.is_none());
+    }
+
+    #[test]
+    fn snapshot_returns_the_exact_parsed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let first = b"[proxy]\nca_cert = 'first/ca.pem'\nca_key = 'first/key.pem'\ndefault_host = 'FIRST.example.'\n";
+        fs::write(&file, first).unwrap();
+
+        let (config, snapshot) = load_snapshot(&file).unwrap();
+        assert_eq!(snapshot, first);
+        assert_eq!(config.proxy.default_host.as_deref(), Some("first.example"));
+
+        fs::write(
+            &file,
+            b"[proxy]\nca_cert = 'second/ca.pem'\nca_key = 'second/key.pem'\ndefault_host = 'SECOND.example.'\n",
+        )
+        .unwrap();
+        let from_snapshot = load_contents(&file, &snapshot).unwrap();
+        let from_file = load(&file).unwrap();
+        assert_eq!(
+            from_snapshot.proxy.default_host.as_deref(),
+            Some("first.example")
+        );
+        assert_eq!(
+            from_file.proxy.default_host.as_deref(),
+            Some("second.example")
+        );
+        assert_eq!(
+            from_snapshot.proxy.ca_cert,
+            dir.path().canonicalize().unwrap().join("first/ca.pem")
+        );
+
+        fs::remove_file(&file).unwrap();
+        let while_replaced = load_contents(&file, &snapshot).unwrap();
+        assert_eq!(
+            while_replaced.proxy.default_host.as_deref(),
+            Some("first.example")
+        );
+    }
+
+    #[test]
+    fn exact_bytes_report_decode_and_toml_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        fs::write(&file, "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n").unwrap();
+
+        let error = load_contents(&file, b"[proxy]\nca_cert = '\xff'\n").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("decode config file"), "{message}");
+        assert!(message.contains("config.toml as UTF-8"), "{message}");
+
+        let error = load_contents(&file, b"[proxy").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("parse config file"), "{message}");
+        assert!(message.contains("config.toml"), "{message}");
     }
 
     #[test]
@@ -404,6 +522,7 @@ output = 'captures/current.pcap'
                 .collect::<Vec<_>>(),
             ["example.com"]
         );
+        assert!(dns.exclude_domains.is_empty());
         assert_eq!(dns.answer_v4, Some("192.0.2.10".parse().unwrap()));
         let capture = config.capture.unwrap();
         assert_eq!(capture.listen, Some("127.0.0.1:57012".parse().unwrap()));
@@ -435,18 +554,91 @@ output = 'captures/current.pcap'
         let config = load_text(
             "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
              [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\n\
-             domains = ['*.EXAMPLE.com.', '*.example.com', 'example.com', '*']\n",
+             all = true\n\
+             domains = ['*.EXAMPLE.com.', '*.example.com', 'example.com', '*']\n\
+             exclude_domains = ['EXCLUDED.example.', 'excluded.example', '*.SKIP.example.', '*']\n",
         )
         .unwrap();
+        let dns = config.dns.unwrap();
         assert_eq!(
-            config
-                .dns
-                .unwrap()
-                .domains
+            dns.domains
                 .iter()
                 .map(DomainPattern::as_str)
                 .collect::<Vec<_>>(),
             ["*.example.com", "example.com", "*"]
+        );
+        assert_eq!(
+            dns.exclude_domains
+                .iter()
+                .map(DomainPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["excluded.example", "*.skip.example", "*"]
+        );
+    }
+
+    #[test]
+    fn parses_and_deduplicates_proxy_exclude_domains() {
+        let config = load_text(
+            "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+             exclude_domains = ['EXAMPLE.com.', 'example.com', '*.SKIP.example.', '*.skip.example', '*']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .proxy
+                .exclude_domains
+                .iter()
+                .map(DomainPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["example.com", "*.skip.example", "*"]
+        );
+    }
+
+    #[test]
+    fn parses_and_deduplicates_proxy_hold_domains() {
+        let config = load_text(
+            "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+             hold_domains = ['EXAMPLE.com.', 'example.com', '*.SKIP.example.', '*.skip.example', '*']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .proxy
+                .hold_domains
+                .iter()
+                .map(DomainPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["example.com", "*.skip.example", "*"]
+        );
+    }
+
+    #[test]
+    fn proxy_and_dns_exclude_domains_are_independent() {
+        let config = load_text(
+            "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+             exclude_domains = ['tls.example']\n\
+             [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\nall = true\n\
+             exclude_domains = ['dns.example']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .proxy
+                .exclude_domains
+                .iter()
+                .map(DomainPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["tls.example"]
+        );
+        assert_eq!(
+            config
+                .dns
+                .unwrap()
+                .exclude_domains
+                .iter()
+                .map(DomainPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["dns.example"]
         );
     }
 
@@ -467,7 +659,7 @@ output = 'captures/current.pcap'
     #[test]
     fn rejects_malformed_dns_wildcard_patterns() {
         let base = "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
-                    [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\n";
+                    [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\nall = true\n";
         for bad in [
             "*.",
             "*..example.com",
@@ -478,12 +670,74 @@ output = 'captures/current.pcap'
             "a*b.com",
             "*.bad_name",
         ] {
-            let error = load_text(&format!("{base}domains = ['{bad}']\n")).unwrap_err();
+            for field in ["domains", "exclude_domains"] {
+                let error = load_text(&format!("{base}{field} = ['{bad}']\n")).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(&format!("invalid dns.{field} entry")),
+                    "{field} {bad}: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_proxy_exclude_domains() {
+        for bad in [
+            "*.",
+            "*..example.com",
+            "*.*.example.com",
+            "*example.com",
+            "foo*.example.com",
+            "foo.*.example.com",
+            "a*b.com",
+            "*.bad_name",
+        ] {
+            let error = load_text(&format!(
+                "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\nexclude_domains = ['{bad}']\n"
+            ))
+            .unwrap_err();
             assert!(
-                format!("{error:#}").contains("invalid dns.domains entry"),
+                format!("{error:#}").contains("invalid proxy.exclude_domains entry"),
                 "{bad}: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_malformed_proxy_hold_domains() {
+        for bad in [
+            "*.",
+            "*..example.com",
+            "*.*.example.com",
+            "*example.com",
+            "foo*.example.com",
+            "foo.*.example.com",
+            "a*b.com",
+            "*.bad_name",
+        ] {
+            let error = load_text(&format!(
+                "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\nhold_domains = ['{bad}']\n"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("invalid proxy.hold_domains entry"),
+                "{bad}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclude_domains_do_not_enable_selective_mode() {
+        let error = load_text(
+            "[proxy]\nca_cert = 'ca.pem'\nca_key = 'key.pem'\n\
+             [dns]\nlisten = '127.0.0.1:5300'\nip = '127.0.0.1'\n\
+             exclude_domains = ['example.com']\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("[dns] requires all = true or at least one domain"),
+            "{error:#}"
+        );
     }
 
     #[test]

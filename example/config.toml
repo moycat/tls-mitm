@@ -5,6 +5,15 @@ ca_key = "certs/test.key.pem"
 listen = ["127.0.0.1:443"]
 upstream_port = 443
 resolver = "1.1.1.1:53"
+# Matching actual SNI values are held after ClientHello without any reply or
+# upstream connection. Held sockets remain open until the client disconnects,
+# including across configuration reloads, and take precedence over exclusions
+# and routes.
+hold_domains = ["hold.example.test"]
+# Matching actual SNI values bypass MITM and every route. The original TLS
+# stream goes to that SNI through resolver on upstream_port (or the listener
+# port when upstream_port is omitted), and is not included in decrypted PCAP.
+exclude_domains = ["connectivitycheck.gstatic.com", "*.updates.example"]
 
 # Example routes use reserved test names; replace them with your own targets.
 # Each route upstream includes its protocol, host, and nonzero port.
@@ -27,10 +36,20 @@ upstream = "tcp://127.0.0.1:8080" # Send decrypted bytes to a plain TCP service.
 # listen = "0.0.0.0:53"
 # ip = "192.0.2.10"
 # all = true
+# exclude_domains = ["connectivitycheck.gstatic.com", "*.updates.example"]
+# Used only when all = true; matching follows the same rules as domains.
 # domains = ["example.com", "*.lab.example.net"] # Used when all = false.
 # "example.com" includes the apex and its subdomains; "*.lab.example.net"
 # includes subdomains only. "*" matches every name. Matching ignores case.
 # Partial-label wildcards such as "api*.example.com" are invalid.
+# dns.exclude_domains controls DNS rewriting only; proxy.exclude_domains above
+# independently controls TLS interception. Set both to bypass both mechanisms.
+
+# This file is monitored and valid changes are reloaded automatically. An
+# invalid change is logged and the last valid configuration remains active.
+# proxy.listen and dns.listen cannot change, [dns] cannot be added or removed,
+# and the entire [capture] section requires a restart to change. A successful
+# reload closes only existing TLS connections whose effective policy changed.
 
 # To stream decrypted PCAP to Wireshark, enable a loopback TCP listener.
 # Packets use the client's actual IP:source port and this proxy's accepted

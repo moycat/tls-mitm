@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -28,7 +28,7 @@ const MAX_CONCURRENT_REQUESTS: usize = 256;
 const LOCAL_TTL: u32 = 60;
 static NEXT_QUERY_ID: AtomicU16 = AtomicU16::new(0x5a31);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DnsConfig {
     pub bind: SocketAddr,
     pub upstream: SocketAddr,
@@ -38,28 +38,116 @@ pub struct DnsConfig {
     /// A plain name matches itself and its subdomains; `*.name` matches only
     /// subdomains, and `*` matches every name.
     pub domains: Vec<DomainPattern>,
+    /// Names that remain on the upstream resolver when `hijack_all` is set.
+    /// These patterns use the same matching rules as `domains`.
+    pub exclude_domains: Vec<DomainPattern>,
+}
+
+/// A DNS server whose UDP and TCP listeners stay bound while its query policy
+/// can be replaced atomically.
+pub struct DnsServer {
+    udp: Arc<UdpSocket>,
+    tcp: TcpListener,
+    config: watch::Sender<Arc<DnsConfig>>,
+}
+
+#[derive(Clone)]
+pub struct DnsConfigHandle {
+    config: watch::Sender<Arc<DnsConfig>>,
+}
+
+pub struct DnsConfigUpdate {
+    config: watch::Sender<Arc<DnsConfig>>,
+    next: Arc<DnsConfig>,
+}
+
+impl DnsConfigUpdate {
+    pub fn publish(self) {
+        self.config.send_replace(self.next);
+    }
+}
+
+impl DnsConfigHandle {
+    /// Validate and stage a query policy without rebinding the DNS listeners.
+    pub fn prepare_replace(&self, config: DnsConfig) -> Result<DnsConfigUpdate> {
+        let current = self.config.borrow();
+        if config.bind != current.bind {
+            bail!(
+                "DNS listener address cannot change from {} to {} during reload",
+                current.bind,
+                config.bind
+            );
+        }
+        drop(current);
+        validate_config(&config)?;
+        Ok(DnsConfigUpdate {
+            config: self.config.clone(),
+            next: Arc::new(config),
+        })
+    }
+
+    /// Publish a new query policy without rebinding the DNS listeners.
+    pub fn replace(&self, config: DnsConfig) -> Result<()> {
+        self.prepare_replace(config)?.publish();
+        Ok(())
+    }
+}
+
+impl DnsServer {
+    pub async fn bind(config: DnsConfig) -> Result<Self> {
+        validate_config(&config)?;
+
+        let tcp = TcpListener::bind(config.bind)
+            .await
+            .with_context(|| format!("binding TCP DNS listener on {}", config.bind))?;
+        let actual_bind = tcp
+            .local_addr()
+            .context("reading TCP DNS listener address")?;
+        let udp = Arc::new(
+            UdpSocket::bind(actual_bind)
+                .await
+                .with_context(|| format!("binding UDP DNS listener on {actual_bind}"))?,
+        );
+        let (config, _) = watch::channel(Arc::new(config));
+        Ok(Self { udp, tcp, config })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.tcp
+            .local_addr()
+            .context("reading DNS listener address")
+    }
+
+    pub fn config_handle(&self) -> DnsConfigHandle {
+        DnsConfigHandle {
+            config: self.config.clone(),
+        }
+    }
+
+    pub async fn serve(self) -> Result<()> {
+        let udp_config = self.config.subscribe();
+        let tcp_config = self.config.subscribe();
+        futures::try_join!(
+            serve_udp(self.udp, udp_config),
+            serve_tcp(self.tcp, tcp_config)
+        )?;
+        Ok(())
+    }
 }
 
 /// Serve DNS over UDP and TCP on the same address. Both transports are required
 /// because clients retry truncated UDP replies over TCP.
 pub async fn serve_dns(config: DnsConfig) -> Result<()> {
+    DnsServer::bind(config).await?.serve().await
+}
+
+fn validate_config(config: &DnsConfig) -> Result<()> {
     if config.upstream.port() == 0 {
         bail!("DNS upstream port must not be zero");
     }
     if points_to_self(config.bind, config.upstream) {
         bail!("DNS upstream points at this DNS listener");
     }
-
-    let udp = Arc::new(
-        UdpSocket::bind(config.bind)
-            .await
-            .with_context(|| format!("binding UDP DNS listener on {}", config.bind))?,
-    );
-    let tcp = TcpListener::bind(config.bind)
-        .await
-        .with_context(|| format!("binding TCP DNS listener on {}", config.bind))?;
-    let config = Arc::new(config);
-    futures::try_join!(serve_udp(udp, config.clone()), serve_tcp(tcp, config))?;
     Ok(())
 }
 
@@ -73,7 +161,7 @@ pub(crate) fn points_to_self(bind: SocketAddr, upstream: SocketAddr) -> bool {
             && (upstream.ip().is_loopback() || upstream.ip().is_unspecified()))
 }
 
-async fn serve_udp(socket: Arc<UdpSocket>, config: Arc<DnsConfig>) -> Result<()> {
+async fn serve_udp(socket: Arc<UdpSocket>, config: watch::Receiver<Arc<DnsConfig>>) -> Result<()> {
     let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let mut buffer = vec![0; MAX_MESSAGE];
     loop {
@@ -81,7 +169,7 @@ async fn serve_udp(socket: Arc<UdpSocket>, config: Arc<DnsConfig>) -> Result<()>
         let (len, peer) = socket.recv_from(&mut buffer).await?;
         let query = buffer[..len].to_vec();
         let socket = socket.clone();
-        let config = config.clone();
+        let config = config.borrow().clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Some(reply) = handle_query(&query, &config, Transport::Udp, peer).await {
@@ -93,7 +181,7 @@ async fn serve_udp(socket: Arc<UdpSocket>, config: Arc<DnsConfig>) -> Result<()>
     }
 }
 
-async fn serve_tcp(listener: TcpListener, config: Arc<DnsConfig>) -> Result<()> {
+async fn serve_tcp(listener: TcpListener, config: watch::Receiver<Arc<DnsConfig>>) -> Result<()> {
     let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     loop {
         let permit = limit.clone().acquire_owned().await?;
@@ -102,7 +190,7 @@ async fn serve_tcp(listener: TcpListener, config: Arc<DnsConfig>) -> Result<()> 
         let config = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_tcp_client(stream, &config, peer).await {
+            if let Err(error) = handle_tcp_client(stream, config, peer).await {
                 warn!(%peer, error = %format_args!("{error:#}"), "DNS TCP client failed");
             }
         });
@@ -111,7 +199,7 @@ async fn serve_tcp(listener: TcpListener, config: Arc<DnsConfig>) -> Result<()> 
 
 async fn handle_tcp_client(
     mut stream: TcpStream,
-    config: &DnsConfig,
+    config: watch::Receiver<Arc<DnsConfig>>,
     peer: SocketAddr,
 ) -> Result<()> {
     loop {
@@ -130,7 +218,8 @@ async fn handle_tcp_client(
         timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut query))
             .await
             .context("DNS TCP query timed out")??;
-        if let Some(reply) = handle_query(&query, config, Transport::Tcp, peer).await {
+        let config = config.borrow().clone();
+        if let Some(reply) = handle_query(&query, &config, Transport::Tcp, peer).await {
             let length = (reply.len() as u16).to_be_bytes();
             timeout(DNS_TIMEOUT, async {
                 stream.write_all(&length).await?;
@@ -345,7 +434,10 @@ fn classify_query(query: &[u8], config: &DnsConfig) -> QueryAction {
 
 fn matches_domain(labels: &[Vec<u8>], config: &DnsConfig) -> bool {
     if config.hijack_all {
-        return true;
+        return !config
+            .exclude_domains
+            .iter()
+            .any(|pattern| pattern.matches_wire_labels(labels));
     }
     config
         .domains
@@ -760,6 +852,7 @@ mod tests {
             answer_v6: None,
             hijack_all: false,
             domains: vec![DomainPattern::parse("Example.COM.").unwrap()],
+            exclude_domains: Vec::new(),
         }
     }
 
@@ -769,6 +862,75 @@ mod tests {
         packet.extend_from_slice(&qtype.to_be_bytes());
         packet.extend_from_slice(&1u16.to_be_bytes());
         packet
+    }
+
+    async fn exchange_with_tcp(stream: &mut TcpStream, query: &[u8]) -> Vec<u8> {
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(query).await.unwrap();
+        let mut length = [0; 2];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut reply = vec![0; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut reply).await.unwrap();
+        reply
+    }
+
+    fn assert_v4_answer(reply: &[u8], expected: Ipv4Addr) {
+        assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 1);
+        assert_eq!(reply.get(reply.len() - 4..), Some(&expected.octets()[..]));
+    }
+
+    #[test]
+    fn bound_server_applies_reloads_to_udp_and_existing_tcp_clients() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            timeout(Duration::from_secs(2), async {
+                let mut initial = config();
+                initial.bind = "127.0.0.1:0".parse().unwrap();
+                let server = DnsServer::bind(initial.clone()).await.unwrap();
+                let address = server.local_addr().unwrap();
+                let handle = server.config_handle();
+                let server_task = tokio::spawn(server.serve());
+
+                let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let request = query("example.com", 1);
+                udp.send_to(&request, address).await.unwrap();
+                let mut packet = [0; 512];
+                let (length, _) = udp.recv_from(&mut packet).await.unwrap();
+                assert_v4_answer(&packet[..length], Ipv4Addr::new(192, 0, 2, 44));
+
+                let mut tcp = TcpStream::connect(address).await.unwrap();
+                let reply = exchange_with_tcp(&mut tcp, &request).await;
+                assert_v4_answer(&reply, Ipv4Addr::new(192, 0, 2, 44));
+
+                let mut replacement = initial.clone();
+                replacement.answer_v4 = Some(Ipv4Addr::new(198, 51, 100, 27));
+                handle.replace(replacement).unwrap();
+
+                udp.send_to(&request, address).await.unwrap();
+                let (length, _) = udp.recv_from(&mut packet).await.unwrap();
+                assert_v4_answer(&packet[..length], Ipv4Addr::new(198, 51, 100, 27));
+
+                let reply = exchange_with_tcp(&mut tcp, &request).await;
+                assert_v4_answer(&reply, Ipv4Addr::new(198, 51, 100, 27));
+
+                let mut moved = initial;
+                moved.bind = "127.0.0.1:5302".parse().unwrap();
+                let error = handle.replace(moved).unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("DNS listener address cannot change"));
+
+                server_task.abort();
+            })
+            .await
+            .unwrap();
+        });
     }
 
     #[test]
@@ -900,6 +1062,59 @@ mod tests {
             assert!(matches!(
                 classify_query(&query(name, 1), &cfg),
                 QueryAction::Hijack { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn all_mode_excludes_domains_with_normal_matching_rules() {
+        let mut cfg = config();
+        cfg.hijack_all = true;
+        cfg.exclude_domains = vec![
+            DomainPattern::parse("Example.COM.").unwrap(),
+            DomainPattern::parse("*.wild.example").unwrap(),
+        ];
+
+        for name in [
+            "example.com",
+            "a.EXAMPLE.com",
+            "host.wild.example",
+            "nested.host.wild.example",
+        ] {
+            assert!(matches!(
+                classify_query(&query(name, 1), &cfg),
+                QueryAction::Forward(_)
+            ));
+        }
+        for name in [
+            "notexample.com",
+            "example.com.evil",
+            "wild.example",
+            "other.test",
+        ] {
+            assert!(matches!(
+                classify_query(&query(name, 1), &cfg),
+                QueryAction::Hijack { .. }
+            ));
+        }
+
+        cfg.hijack_all = false;
+        cfg.domains = vec![DomainPattern::parse("example.com").unwrap()];
+        assert!(matches!(
+            classify_query(&query("example.com", 1), &cfg),
+            QueryAction::Hijack { .. }
+        ));
+    }
+
+    #[test]
+    fn star_exclusion_forwards_every_name_in_all_mode() {
+        let mut cfg = config();
+        cfg.hijack_all = true;
+        cfg.exclude_domains = vec![DomainPattern::parse("*").unwrap()];
+        for name in ["example.com", "other.test", "a.b.example.org"] {
+            assert!(matches!(
+                classify_query(&query(name, 1), &cfg),
+                QueryAction::Forward(_)
             ));
         }
     }

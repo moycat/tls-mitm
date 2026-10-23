@@ -14,16 +14,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tokio::time::timeout;
-use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
+use tokio_rustls::{server::StartHandshake, LazyConfigAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 512;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Route {
     pub pattern: DomainPattern,
     pub host: String,
@@ -175,9 +175,15 @@ pub struct ProxyConfig {
     pub resolver: SocketAddr,
     pub ca: CertificateAuthority,
     pub routes: Vec<Route>,
+    pub hold_domains: Vec<DomainPattern>,
+    pub exclude_domains: Vec<DomainPattern>,
     pub default_host: Option<String>,
     pub upstream_client: Arc<ClientConfig>,
     pub capture: Option<Arc<CaptureHub>>,
+    /// Changes when the downstream signing CA material changes.
+    pub ca_revision: u64,
+    /// Changes when the verified upstream trust material changes.
+    pub upstream_trust_revision: u64,
 }
 
 pub fn build_upstream_client(extra_ca: Option<&Path>) -> Result<Arc<ClientConfig>> {
@@ -203,7 +209,46 @@ pub fn build_upstream_client(extra_ca: Option<&Path>) -> Result<Arc<ClientConfig
 
 pub struct Proxy {
     listener: TcpListener,
-    config: Arc<ProxyConfig>,
+    config: watch::Sender<Arc<ProxyConfig>>,
+}
+
+#[derive(Clone)]
+pub struct ProxyConfigHandle {
+    config: watch::Sender<Arc<ProxyConfig>>,
+}
+
+pub struct ProxyConfigUpdate {
+    config: watch::Sender<Arc<ProxyConfig>>,
+    next: Arc<ProxyConfig>,
+}
+
+impl ProxyConfigUpdate {
+    pub fn publish(self) {
+        self.config.send_replace(self.next);
+    }
+}
+
+impl ProxyConfigHandle {
+    pub fn prepare_replace(&self, config: ProxyConfig) -> Result<ProxyConfigUpdate> {
+        let current = self.config.borrow();
+        if config.listen != current.listen {
+            bail!(
+                "TLS listener address cannot change from {} to {} during reload",
+                current.listen,
+                config.listen
+            );
+        }
+        drop(current);
+        Ok(ProxyConfigUpdate {
+            config: self.config.clone(),
+            next: Arc::new(config),
+        })
+    }
+
+    pub fn replace(&self, config: ProxyConfig) -> Result<()> {
+        self.prepare_replace(config)?.publish();
+        Ok(())
+    }
 }
 
 impl Proxy {
@@ -211,14 +256,18 @@ impl Proxy {
         let listener = TcpListener::bind(config.listen)
             .await
             .with_context(|| format!("bind TLS listener {}", config.listen))?;
-        Ok(Self {
-            listener,
-            config: Arc::new(config),
-        })
+        let (config, _) = watch::channel(Arc::new(config));
+        Ok(Self { listener, config })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.listener.local_addr()?)
+    }
+
+    pub fn config_handle(&self) -> ProxyConfigHandle {
+        ProxyConfigHandle {
+            config: self.config.clone(),
+        }
     }
 
     pub async fn serve(self) -> Result<()> {
@@ -231,7 +280,7 @@ impl Proxy {
             let mut log = ConnectionLog::new(peer, local);
             log.debug("accepted");
             let permit = permits.clone().acquire_owned().await?;
-            let config = self.config.clone();
+            let config = self.config.subscribe();
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(error) = handle(socket, config, &mut log).await {
@@ -293,6 +342,33 @@ impl ConnectionLog {
         );
     }
 
+    fn tls_passthrough(&self, upstream: &str) {
+        info!(
+            client = %self.peer,
+            host = self.host.as_deref().unwrap_or("-"),
+            upstream,
+            "passing through TLS without interception"
+        );
+    }
+
+    fn held(&self) {
+        info!(
+            client = %self.peer,
+            host = self.host.as_deref().unwrap_or("-"),
+            "holding TLS connection without replying"
+        );
+    }
+
+    fn hold_closed(&self, discarded: u64) {
+        info!(
+            client = %self.peer,
+            host = self.host.as_deref().unwrap_or("-"),
+            client_bytes_discarded = discarded,
+            duration_ms = self.started.elapsed().as_millis(),
+            "held TLS connection closed by client"
+        );
+    }
+
     fn upstream_connected(&self, address: SocketAddr) {
         debug!(
             client = %self.peer,
@@ -315,6 +391,15 @@ impl ConnectionLog {
         );
     }
 
+    fn reconfigured(&self) {
+        info!(
+            client = %self.peer,
+            host = self.host.as_deref().unwrap_or("-"),
+            duration_ms = self.started.elapsed().as_millis(),
+            "closed proxy connection after configuration changed its policy"
+        );
+    }
+
     fn warn(&self, error: &anyhow::Error) {
         warn!(
             client = %self.peer,
@@ -330,125 +415,447 @@ impl ConnectionLog {
 trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
-async fn handle(
-    socket: TcpStream,
-    config: Arc<ProxyConfig>,
-    log: &mut ConnectionLog,
-) -> Result<()> {
-    let incoming = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), socket);
-    let start = timeout(HANDSHAKE_TIMEOUT, incoming)
-        .await
-        .context("timed out waiting for ClientHello")??;
-    let client_sni = start.client_hello().server_name().map(str::to_owned);
-    let had_sni = client_sni.is_some();
+struct RecordingStream {
+    inner: TcpStream,
+    recorded: Vec<u8>,
+    recording: bool,
+}
+
+impl RecordingStream {
+    fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            recorded: Vec::new(),
+            recording: true,
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        self.recording = false;
+        self.recorded.clear();
+    }
+
+    fn into_parts(self) -> (TcpStream, Vec<u8>) {
+        (self.inner, self.recorded)
+    }
+}
+
+impl AsyncRead for RecordingStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let previous_len = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buffer);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) && this.recording {
+            this.recorded
+                .extend_from_slice(&buffer.filled()[previous_len..]);
+        }
+        result
+    }
+}
+
+impl AsyncWrite for RecordingStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConnectionPlan {
+    Hold {
+        name: String,
+    },
+    Passthrough {
+        name: String,
+        port: u16,
+        resolver: Option<SocketAddr>,
+    },
+    Intercept {
+        name: String,
+        target_host: String,
+        target_port: u16,
+        target_tls: bool,
+        verify: bool,
+        verify_name: String,
+        resolver: Option<SocketAddr>,
+        ca_revision: u64,
+        upstream_trust_revision: Option<u64>,
+    },
+}
+
+impl ConnectionPlan {
+    fn name(&self) -> &str {
+        match self {
+            Self::Hold { name } | Self::Passthrough { name, .. } | Self::Intercept { name, .. } => {
+                name
+            }
+        }
+    }
+}
+
+fn connection_plan(config: &ProxyConfig, client_sni: Option<&str>) -> Result<ConnectionPlan> {
     let name = client_sni
+        .map(str::to_owned)
         .or_else(|| config.default_host.clone())
         .ok_or_else(|| {
             anyhow!("TLS ClientHello has no SNI; set proxy.default_host for this client")
         })?;
-    let name = normalize_dns_name(&name)?;
-    if had_sni {
-        log.sni = Some(name.clone());
+
+    if client_sni.is_some()
+        && config
+            .hold_domains
+            .iter()
+            .any(|pattern| pattern.matches_normalized_name(&name))
+    {
+        return Ok(ConnectionPlan::Hold { name });
     }
-    log.host = Some(name.clone());
-    log.debug("client_hello");
-    let offered_alpn: Vec<Vec<u8>> = start
-        .client_hello()
-        .alpn()
-        .map(|values| values.map(|value| value.to_vec()).collect())
-        .unwrap_or_default();
+
+    if client_sni.is_some()
+        && config
+            .exclude_domains
+            .iter()
+            .any(|pattern| pattern.matches_normalized_name(&name))
+    {
+        return Ok(ConnectionPlan::Passthrough {
+            name,
+            port: config.default_upstream_port,
+            resolver: Some(config.resolver),
+        });
+    }
 
     let route = select_route(&config.routes, &name);
     let (target_host, target_port, target_tls, verify, verify_name) = match route {
         Some(route) => (
-            route.host.as_str(),
+            route.host.clone(),
             route.port,
             route.tls,
             route.verify,
-            route.verify_name.as_deref().unwrap_or(&name),
+            route.verify_name.clone().unwrap_or_else(|| name.clone()),
         ),
         None => (
-            name.as_str(),
+            name.clone(),
             config.default_upstream_port,
             true,
             true,
-            name.as_str(),
+            name.clone(),
         ),
     };
-    let upstream_uri = format_upstream_uri(target_tls, target_host, target_port);
-    let verification_name = if target_tls && verify {
-        verify_name
-    } else {
-        ""
-    };
-    if let Some(route) = route {
-        log.configured_route(route.pattern.as_str(), &upstream_uri, verification_name);
-    } else {
-        log.host_upstream(&upstream_uri, verification_name);
-    }
-    let addresses = resolve_host(target_host, target_port, config.resolver)
-        .await
-        .with_context(|| format!("resolve upstream {target_host}"))?;
-    let tcp = connect_first(&addresses).await?;
-    log.upstream_connected(tcp.peer_addr()?);
+    let resolver = target_host
+        .parse::<IpAddr>()
+        .is_err()
+        .then_some(config.resolver);
+    Ok(ConnectionPlan::Intercept {
+        name,
+        target_host,
+        target_port,
+        target_tls,
+        verify,
+        verify_name,
+        resolver,
+        ca_revision: config.ca_revision,
+        upstream_trust_revision: (target_tls && verify).then_some(config.upstream_trust_revision),
+    })
+}
 
-    let (upstream, selected_alpn): (Box<dyn Duplex>, Option<Vec<u8>>) = if target_tls {
-        let mut client_config = (*config.upstream_client).clone();
-        client_config.alpn_protocols = offered_alpn;
-        if !verify {
-            // Do not share TLS session tickets with routes that validate certificates.
-            client_config.resumption = rustls::client::Resumption::disabled();
-            client_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoCertificateValidation));
+async fn handle(
+    socket: TcpStream,
+    mut configs: watch::Receiver<Arc<ProxyConfig>>,
+    log: &mut ConnectionLog,
+) -> Result<()> {
+    let incoming = LazyConfigAcceptor::new(
+        rustls::server::Acceptor::default(),
+        RecordingStream::new(socket),
+    );
+    let start = timeout(HANDSHAKE_TIMEOUT, incoming)
+        .await
+        .context("timed out waiting for ClientHello")??;
+    let client_sni = start
+        .client_hello()
+        .server_name()
+        .map(normalize_dns_name)
+        .transpose()?;
+    if let Some(name) = &client_sni {
+        log.sni = Some(name.clone());
+    }
+    let config = configs.borrow().clone();
+    let plan = connection_plan(&config, client_sni.as_deref())?;
+    log.host = Some(plan.name().to_owned());
+    log.debug("client_hello");
+
+    if matches!(plan, ConnectionPlan::Hold { .. }) {
+        log.held();
+        let accepted = start.accepted;
+        let (client, recorded) = start.io.into_parts();
+        let initial_discarded = recorded.len() as u64;
+        drop(recorded);
+        drop(accepted);
+        drop(config);
+        let discarded = hold_until_client_closes(client).await?;
+        log.hold_closed(initial_discarded.saturating_add(discarded));
+        return Ok(());
+    }
+
+    let establish = establish_connection(start, config, &plan, log);
+    tokio::pin!(establish);
+    let established = loop {
+        let changed_result = {
+            let changed = configs.changed();
+            tokio::pin!(changed);
+            // Poll policy changes first so a simultaneously ready reload wins
+            // over completion of setup performed with the previous policy.
+            match futures::future::select(changed, establish.as_mut()).await {
+                futures::future::Either::Left((changed, _)) => changed,
+                futures::future::Either::Right((result, _)) => break result?,
+            }
+        };
+        if changed_result.is_err() {
+            break establish.await?;
         }
-        let server_name = ServerName::try_from(verify_name.to_owned())
-            .context("invalid upstream TLS verification name")?;
-        let stream = timeout(
-            HANDSHAKE_TIMEOUT,
-            TlsConnector::from(Arc::new(client_config)).connect(server_name, tcp),
-        )
-        .await
-        .context("upstream TLS handshake timeout")?
-        .with_context(|| format!("upstream TLS handshake failed for {verify_name}"))?;
-        let alpn = stream.get_ref().1.alpn_protocol().map(|v| v.to_vec());
-        (Box::new(stream), alpn)
-    } else {
-        (Box::new(tcp), None)
+        let next = configs.borrow_and_update().clone();
+        let still_valid =
+            connection_plan(&next, client_sni.as_deref()).is_ok_and(|next_plan| next_plan == plan);
+        if !still_valid {
+            log.reconfigured();
+            return Ok(());
+        }
     };
 
-    let leaf = config.ca.for_host(&name).await?;
-    let mut server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(leaf.certs.clone(), leaf.key.clone_key())
-        .context("configure generated leaf certificate")?;
-    if let Some(protocol) = selected_alpn {
-        server_config.alpn_protocols = vec![protocol];
-    }
-    let client = timeout(
-        HANDSHAKE_TIMEOUT,
-        start.into_stream(Arc::new(server_config)),
+    relay_with_reload(
+        established.client,
+        established.upstream,
+        established.capture,
+        established.initial_sent,
+        &mut configs,
+        &client_sni,
+        &plan,
+        log,
     )
     .await
-    .context("downstream TLS handshake timeout")??;
-    log.debug("tls_handshake_complete");
+}
 
-    let flow = config
-        .capture
-        .as_ref()
-        .map(|hub| hub.flow(log.peer, log.local));
+struct EstablishedConnection {
+    client: Box<dyn Duplex>,
+    upstream: Box<dyn Duplex>,
+    capture: Option<Arc<CaptureHub>>,
+    initial_sent: u64,
+}
+
+async fn establish_connection(
+    mut start: StartHandshake<RecordingStream>,
+    config: Arc<ProxyConfig>,
+    plan: &ConnectionPlan,
+    log: &ConnectionLog,
+) -> Result<EstablishedConnection> {
+    match &plan {
+        ConnectionPlan::Hold { .. } => {
+            unreachable!("hold plans are handled before upstream setup")
+        }
+        ConnectionPlan::Passthrough {
+            name,
+            port,
+            resolver,
+        } => {
+            let upstream_uri = format_upstream_uri(true, name, *port);
+            log.tls_passthrough(&upstream_uri);
+            let addresses = resolve_host(name, *port, resolver.unwrap_or(config.resolver))
+                .await
+                .with_context(|| format!("resolve passthrough upstream {name}"))?;
+            let mut upstream = connect_first(&addresses).await?;
+            log.upstream_connected(upstream.peer_addr()?);
+            let (client, recorded) = start.io.into_parts();
+            upstream
+                .write_all(&recorded)
+                .await
+                .context("client_to_upstream write recorded ClientHello failed")?;
+            Ok(EstablishedConnection {
+                client: Box::new(client),
+                upstream: Box::new(upstream),
+                capture: None,
+                initial_sent: recorded.len() as u64,
+            })
+        }
+        ConnectionPlan::Intercept {
+            name,
+            target_host,
+            target_port,
+            target_tls,
+            verify,
+            verify_name,
+            resolver,
+            ..
+        } => {
+            let offered_alpn: Vec<Vec<u8>> = start
+                .client_hello()
+                .alpn()
+                .map(|values| values.map(|value| value.to_vec()).collect())
+                .unwrap_or_default();
+            start.io.stop_recording();
+            let upstream_uri = format_upstream_uri(*target_tls, target_host, *target_port);
+            let verification_name = if *target_tls && *verify {
+                verify_name.as_str()
+            } else {
+                ""
+            };
+            if let Some(route) = select_route(&config.routes, name) {
+                log.configured_route(route.pattern.as_str(), &upstream_uri, verification_name);
+            } else {
+                log.host_upstream(&upstream_uri, verification_name);
+            }
+            let addresses = resolve_host(
+                target_host,
+                *target_port,
+                resolver.unwrap_or(config.resolver),
+            )
+            .await
+            .with_context(|| format!("resolve upstream {target_host}"))?;
+            let tcp = connect_first(&addresses).await?;
+            log.upstream_connected(tcp.peer_addr()?);
+
+            let (upstream, selected_alpn): (Box<dyn Duplex>, Option<Vec<u8>>) = if *target_tls {
+                let mut client_config = (*config.upstream_client).clone();
+                client_config.alpn_protocols = offered_alpn;
+                if !*verify {
+                    // Do not share TLS session tickets with routes that validate certificates.
+                    client_config.resumption = rustls::client::Resumption::disabled();
+                    client_config
+                        .dangerous()
+                        .set_certificate_verifier(Arc::new(NoCertificateValidation));
+                }
+                let server_name = ServerName::try_from(verify_name.clone())
+                    .context("invalid upstream TLS verification name")?;
+                let stream = timeout(
+                    HANDSHAKE_TIMEOUT,
+                    TlsConnector::from(Arc::new(client_config)).connect(server_name, tcp),
+                )
+                .await
+                .context("upstream TLS handshake timeout")?
+                .with_context(|| format!("upstream TLS handshake failed for {verify_name}"))?;
+                let alpn = stream.get_ref().1.alpn_protocol().map(|v| v.to_vec());
+                (Box::new(stream), alpn)
+            } else {
+                (Box::new(tcp), None)
+            };
+
+            let leaf = config.ca.for_host(name).await?;
+            let mut server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(leaf.certs.clone(), leaf.key.clone_key())
+                .context("configure generated leaf certificate")?;
+            if let Some(protocol) = selected_alpn {
+                server_config.alpn_protocols = vec![protocol];
+            }
+            let client = timeout(
+                HANDSHAKE_TIMEOUT,
+                start.into_stream(Arc::new(server_config)),
+            )
+            .await
+            .context("downstream TLS handshake timeout")??;
+            log.debug("tls_handshake_complete");
+            Ok(EstablishedConnection {
+                client: Box::new(client),
+                upstream,
+                capture: config.capture.clone(),
+                initial_sent: 0,
+            })
+        }
+    }
+}
+
+async fn hold_until_client_closes<R>(mut client: R) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::io::copy(&mut client, &mut tokio::io::sink())
+        .await
+        .context("read held TLS connection")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_with_reload<C, U>(
+    client: C,
+    upstream: U,
+    capture: Option<Arc<CaptureHub>>,
+    initial_sent: u64,
+    configs: &mut watch::Receiver<Arc<ProxyConfig>>,
+    client_sni: &Option<String>,
+    plan: &ConnectionPlan,
+    log: &ConnectionLog,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let latest = configs.borrow_and_update().clone();
+    if !connection_plan(&latest, client_sni.as_deref()).is_ok_and(|next| next == *plan) {
+        log.reconfigured();
+        return Ok(());
+    }
+    let flow = capture.map(|hub| hub.flow(log.peer, log.local));
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
-    let result = futures::try_join!(
-        copy_with_capture(&mut client_read, &mut upstream_write, flow.as_ref(), true),
-        copy_with_capture(&mut upstream_read, &mut client_write, flow.as_ref(), false)
-    );
-    if let Some(flow) = flow {
-        flow.close();
+    let transfer = async {
+        futures::try_join!(
+            copy_with_capture(&mut client_read, &mut upstream_write, flow.as_ref(), true),
+            copy_with_capture(&mut upstream_read, &mut client_write, flow.as_ref(), false)
+        )
+    };
+    tokio::pin!(transfer);
+    loop {
+        let changed_result = {
+            let changed = configs.changed();
+            tokio::pin!(changed);
+            match futures::future::select(transfer.as_mut(), changed).await {
+                futures::future::Either::Left((result, _)) => {
+                    let (sent, received) = result?;
+                    if let Some(flow) = &flow {
+                        flow.close();
+                    }
+                    log.closed(initial_sent.saturating_add(sent), received);
+                    return Ok(());
+                }
+                futures::future::Either::Right((changed, _)) => changed,
+            }
+        };
+        if changed_result.is_err() {
+            let (sent, received) = transfer.await?;
+            if let Some(flow) = &flow {
+                flow.close();
+            }
+            log.closed(initial_sent.saturating_add(sent), received);
+            return Ok(());
+        }
+        let next = configs.borrow_and_update().clone();
+        let still_valid =
+            connection_plan(&next, client_sni.as_deref()).is_ok_and(|next_plan| next_plan == *plan);
+        if !still_valid {
+            if let Some(flow) = &flow {
+                flow.close();
+            }
+            log.reconfigured();
+            return Ok(());
+        }
     }
-    let (sent, received) = result?;
-    log.closed(sent, received);
-    Ok(())
 }
 
 async fn connect_first(addresses: &[SocketAddr]) -> Result<TcpStream> {
@@ -527,6 +934,7 @@ fn is_missing_close_notify(error: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use std::io;
+    use std::path::Path;
     use std::pin::Pin;
     use std::task::{Context as TaskContext, Poll};
     use tokio::io::ReadBuf;
@@ -537,6 +945,26 @@ mod tests {
         written: Vec<u8>,
         fail_write: bool,
         shutdown_error: io::ErrorKind,
+    }
+
+    fn test_config() -> ProxyConfig {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/certs/test.crt.pem");
+        let key = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/certs/test.key.pem");
+        ProxyConfig {
+            listen: "127.0.0.1:443".parse().unwrap(),
+            default_upstream_port: 443,
+            resolver: "127.0.0.1:5353".parse().unwrap(),
+            ca: CertificateAuthority::new(&cert, &key).unwrap(),
+            routes: Vec::new(),
+            hold_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+            default_host: None,
+            upstream_client: build_upstream_client(None).unwrap(),
+            capture: None,
+            ca_revision: 0,
+            upstream_trust_revision: 0,
+        }
     }
 
     impl AsyncWrite for ErrorWriter {
@@ -662,6 +1090,100 @@ mod tests {
         assert_eq!(
             format_upstream_uri(true, "2001:db8::1", 8443),
             "tls://[2001:db8::1]:8443"
+        );
+    }
+
+    #[test]
+    fn proxy_exclusion_uses_actual_sni_and_overrides_routes() {
+        let mut config = test_config();
+        config.default_host = Some("excluded.example".to_owned());
+        config.exclude_domains = vec![DomainPattern::parse("excluded.example").unwrap()];
+        config.routes = vec![Route::parse("excluded.example=tcp://127.0.0.1:8080").unwrap()];
+
+        assert!(matches!(
+            connection_plan(&config, Some("excluded.example")).unwrap(),
+            ConnectionPlan::Passthrough {
+                name,
+                port: 443,
+                ..
+            } if name == "excluded.example"
+        ));
+        assert!(matches!(
+            connection_plan(&config, None).unwrap(),
+            ConnectionPlan::Intercept {
+                target_port: 8080,
+                target_tls: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn proxy_hold_uses_actual_sni_and_overrides_exclusion_and_routes() {
+        let mut config = test_config();
+        config.default_host = Some("held.example".to_owned());
+        config.hold_domains = vec![DomainPattern::parse("held.example").unwrap()];
+        config.exclude_domains = vec![DomainPattern::parse("held.example").unwrap()];
+        config.routes = vec![Route::parse("held.example=tcp://127.0.0.1:8080").unwrap()];
+
+        assert!(matches!(
+            connection_plan(&config, Some("held.example")).unwrap(),
+            ConnectionPlan::Hold { name } if name == "held.example"
+        ));
+        assert!(matches!(
+            connection_plan(&config, Some("deep.held.example")).unwrap(),
+            ConnectionPlan::Hold { name } if name == "deep.held.example"
+        ));
+        assert!(matches!(
+            connection_plan(&config, None).unwrap(),
+            ConnectionPlan::Intercept {
+                target_port: 8080,
+                target_tls: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn held_connection_waits_for_client_eof() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (mut client, server) = tokio::io::duplex(64);
+            let held = tokio::spawn(hold_until_client_closes(server));
+
+            client.write_all(b"more client bytes").await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(!held.is_finished());
+
+            drop(client);
+            assert_eq!(held.await.unwrap().unwrap(), 17);
+        });
+    }
+
+    #[test]
+    fn effective_policy_changes_only_for_relevant_reload_fields() {
+        let mut config = test_config();
+        config.routes = vec![
+            Route::parse("active.example=tcp://127.0.0.1:8080").unwrap(),
+            Route::parse("other.example=tcp://127.0.0.1:8081").unwrap(),
+        ];
+        let original = connection_plan(&config, Some("active.example")).unwrap();
+
+        config.routes[1] = Route::parse("other.example=tcp://127.0.0.1:9091").unwrap();
+        config.resolver = "127.0.0.1:5454".parse().unwrap();
+        assert_eq!(
+            connection_plan(&config, Some("active.example")).unwrap(),
+            original,
+            "an unrelated route and resolver changes must not close a numeric-route connection"
+        );
+
+        config.routes[0] = Route::parse("active.example=tcp://127.0.0.1:9090").unwrap();
+        assert_ne!(
+            connection_plan(&config, Some("active.example")).unwrap(),
+            original
         );
     }
 
