@@ -755,8 +755,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
     use std::io::Read;
-    use std::process::Command;
+    use std::os::unix::ffi::OsStrExt;
     use std::time::Instant;
     use tokio::io::AsyncReadExt;
 
@@ -1056,11 +1057,9 @@ mod tests {
     fn fifo_waits_for_reader_and_sends_header_on_reconnect() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("capture.fifo");
-        assert!(Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success());
+        let path_bytes = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

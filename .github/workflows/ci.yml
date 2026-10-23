@@ -44,11 +44,10 @@ jobs:
           cache-bin: "false"
           cache-targets: "true"
 
-      - name: Check required tools
+      - name: Check Rust toolchain
         run: |
           rustc --version
           cargo --version
-          openssl version
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked

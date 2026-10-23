@@ -2,7 +2,7 @@
 
 ## Repository Overview
 
-`tls-mitm` is a Rust 2021 command-line tool for authorized TLS testing. It reads SNI, signs a temporary server certificate with a configured CA, proxies application bytes to a TLS or plain TCP upstream, and optionally rewrites DNS answers and streams decrypted traffic as PCAP. Cargo manages the build; OpenSSL is required at runtime for certificate signing and by certificate tests. `.github/workflows/ci.yml` runs quality checks and a release build on Linux and macOS.
+`tls-mitm` is a Rust 2021 command-line tool for authorized TLS testing. It reads SNI, signs a temporary server certificate with a configured CA, proxies application bytes to a TLS or plain TCP upstream, and optionally rewrites DNS answers and streams decrypted traffic as PCAP. Cargo manages the build and native Rust libraries handle certificate signing. `.github/workflows/ci.yml` runs quality checks and a release build on Linux and macOS.
 
 - `src/config.rs`: TOML loading and validation.
 - `src/cert.rs`: CA validation, leaf signing, and certificate cache.
