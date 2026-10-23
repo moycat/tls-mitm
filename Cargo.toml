@@ -17,7 +17,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 futures = "0.3.34"
 libc = "0.2.189"
-rcgen = { version = "0.14.10", features = ["x509-parser"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 ring = "0.17.14"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -29,4 +29,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 webpki-roots = "1.0.9"
 x509-parser = "0.18.1"
+
+[dev-dependencies]
+pem = "4.0.0"
 

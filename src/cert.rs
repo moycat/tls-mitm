@@ -98,17 +98,11 @@ impl CertificateAuthority {
     pub fn new(cert: &Path, key: &Path) -> Result<Self> {
         let cert_path = fs::canonicalize(cert).context("read CA certificate path")?;
         let key_path = fs::canonicalize(key).context("read CA private-key path")?;
-        let cert_chain = CertificateDer::pem_file_iter(&cert_path)
-            .context("open CA certificate bundle")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("parse CA certificate bundle")?;
-        if cert_chain.is_empty() {
-            bail!("CA certificate bundle contains no certificates");
-        }
-        let private_key =
-            PrivateKeyDer::from_pem_file(&key_path).context("parse CA private key")?;
-        let key_pair = KeyPair::try_from(&private_key)
-            .context("parse CA private key as unencrypted PKCS#8 PEM")?;
+        let cert_chain = load_certificate_chain(&cert_path)?;
+        let private_key = load_private_key(&key_path)?;
+        let key_pair = KeyPair::try_from(&private_key).context(
+            "load CA private key for signing; supported algorithms are RSA, ECDSA, and Ed25519",
+        )?;
         {
             let (remainder, parsed) = parse_x509_certificate(cert_chain[0].as_ref())
                 .map_err(|error| anyhow!("parse CA certificate: {error}"))?;
@@ -232,6 +226,40 @@ impl CertificateAuthority {
     }
 }
 
+fn load_certificate_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let encoded = fs::read(path).context("read CA certificate")?;
+    if !looks_like_pem(&encoded) {
+        return Ok(vec![CertificateDer::from(encoded)]);
+    }
+    let certs = CertificateDer::pem_slice_iter(&encoded)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parse CA certificate PEM bundle")?;
+    if certs.is_empty() {
+        bail!("CA certificate PEM contains no CERTIFICATE section");
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let encoded = fs::read(path).context("read CA private key")?;
+    if looks_like_pem(&encoded) {
+        return PrivateKeyDer::from_pem_slice(&encoded).context(
+            "parse CA private key PEM; expected an unencrypted PKCS#8, PKCS#1 RSA, or SEC1 EC key",
+        );
+    }
+    PrivateKeyDer::try_from(encoded).map_err(|error| {
+        anyhow!(
+            "parse CA private key DER; expected an unencrypted PKCS#8, PKCS#1 RSA, or SEC1 EC key: {error}"
+        )
+    })
+}
+
+fn looks_like_pem(encoded: &[u8]) -> bool {
+    encoded
+        .windows(b"-----BEGIN".len())
+        .any(|window| window == b"-----BEGIN")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +294,110 @@ mod tests {
         distinguished_name.push(DnType::CommonName, common_name);
         params.distinguished_name = distinguished_name;
         Ok(params)
+    }
+
+    fn der_element(input: &[u8]) -> Result<(u8, &[u8], usize)> {
+        let tag = *input.first().context("missing DER tag")?;
+        let first_length = *input.get(1).context("missing DER length")?;
+        let (length, header_length) = if first_length & 0x80 == 0 {
+            (usize::from(first_length), 2)
+        } else {
+            let length_bytes = usize::from(first_length & 0x7f);
+            if length_bytes == 0 || length_bytes > std::mem::size_of::<usize>() {
+                bail!("unsupported DER length");
+            }
+            let encoded = input
+                .get(2..2 + length_bytes)
+                .context("truncated DER length")?;
+            let length = encoded
+                .iter()
+                .fold(0usize, |value, byte| (value << 8) | usize::from(*byte));
+            (length, 2 + length_bytes)
+        };
+        let end = header_length
+            .checked_add(length)
+            .context("DER length overflow")?;
+        let content = input
+            .get(header_length..end)
+            .context("truncated DER element")?;
+        Ok((tag, content, end))
+    }
+
+    fn encode_der(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut encoded = vec![tag];
+        if content.len() < 128 {
+            encoded.push(content.len() as u8);
+        } else {
+            let length = content.len().to_be_bytes();
+            let first = length.iter().position(|byte| *byte != 0).unwrap();
+            encoded.push(0x80 | (length.len() - first) as u8);
+            encoded.extend_from_slice(&length[first..]);
+        }
+        encoded.extend_from_slice(content);
+        encoded
+    }
+
+    fn pkcs8_private_key(pkcs8: &[u8]) -> Result<&[u8]> {
+        let (tag, outer, _) = der_element(pkcs8)?;
+        if tag != 0x30 {
+            bail!("PKCS#8 key is not a sequence");
+        }
+        let (_, _, version_length) = der_element(outer)?;
+        let (_, _, algorithm_length) = der_element(&outer[version_length..])?;
+        let (tag, private_key, _) = der_element(&outer[version_length + algorithm_length..])?;
+        if tag != 0x04 {
+            bail!("PKCS#8 private key is not an octet string");
+        }
+        Ok(private_key)
+    }
+
+    fn compact_ec_pkcs8(pkcs8: &[u8]) -> Result<Vec<u8>> {
+        let (tag, outer, _) = der_element(pkcs8)?;
+        if tag != 0x30 {
+            bail!("PKCS#8 key is not a sequence");
+        }
+        let (_, _, version_length) = der_element(outer)?;
+        let (_, _, algorithm_length) = der_element(&outer[version_length..])?;
+        let private_offset = version_length + algorithm_length;
+        let (tag, private_key, private_length) = der_element(&outer[private_offset..])?;
+        if tag != 0x04 {
+            bail!("PKCS#8 private key is not an octet string");
+        }
+        let (tag, ec_key, _) = der_element(private_key)?;
+        if tag != 0x30 {
+            bail!("EC private key is not a sequence");
+        }
+
+        let mut compact_ec_key = Vec::new();
+        let mut remaining = ec_key;
+        while !remaining.is_empty() {
+            let (tag, _, length) = der_element(remaining)?;
+            if tag != 0xa1 {
+                compact_ec_key.extend_from_slice(&remaining[..length]);
+            }
+            remaining = &remaining[length..];
+        }
+
+        let private_key = encode_der(0x30, &compact_ec_key);
+        let private_key = encode_der(0x04, &private_key);
+        let mut compact = outer[..private_offset].to_vec();
+        compact.extend_from_slice(&private_key);
+        compact.extend_from_slice(&outer[private_offset + private_length..]);
+        Ok(encode_der(0x30, &compact))
+    }
+
+    fn private_key_pem(label: &str, der: Vec<u8>) -> Vec<u8> {
+        pem::encode(&pem::Pem::new(label, der)).into_bytes()
+    }
+
+    fn assert_ca_loads(directory: &Path, name: &str, cert: &[u8], key: &[u8]) -> Result<()> {
+        let cert_path = directory.join(format!("{name}.crt"));
+        let key_path = directory.join(format!("{name}.key"));
+        fs::write(&cert_path, cert)?;
+        fs::write(&key_path, key)?;
+        let ca = CertificateAuthority::new(&cert_path, &key_path)?;
+        assert_eq!(ca.issue_leaf("format.example")?.credentials.certs.len(), 2);
+        Ok(())
     }
 
     #[test]
@@ -450,6 +582,96 @@ mod tests {
                 &[],
                 UnixTime::now(),
             )?;
+        Ok(())
+    }
+
+    #[test]
+    fn loads_common_ca_certificate_and_private_key_formats() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let ec = CertifiedIssuer::self_signed(
+            ca_params("P-384 Test CA", BasicConstraints::Unconstrained)?,
+            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)?,
+        )?;
+        let ec_pkcs8 = ec.key().serialize_der();
+        let ec_sec1 = pkcs8_private_key(&ec_pkcs8)?.to_vec();
+        let ec_cert_pem = ec.pem().into_bytes();
+        assert_ca_loads(
+            tmp.path(),
+            "compact-pkcs8-pem",
+            &ec_cert_pem,
+            &private_key_pem("PRIVATE KEY", compact_ec_pkcs8(&ec_pkcs8)?),
+        )?;
+        assert_ca_loads(
+            tmp.path(),
+            "sec1-pem",
+            &ec_cert_pem,
+            &private_key_pem("EC PRIVATE KEY", ec_sec1.clone()),
+        )?;
+        assert_ca_loads(tmp.path(), "pkcs8-der", ec.der().as_ref(), &ec_pkcs8)?;
+        assert_ca_loads(tmp.path(), "sec1-der", &ec_cert_pem, &ec_sec1)?;
+
+        let rsa = CertifiedIssuer::self_signed(
+            ca_params("RSA Test CA", BasicConstraints::Unconstrained)?,
+            KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?,
+        )?;
+        let rsa_pkcs1 = pkcs8_private_key(&rsa.key().serialize_der())?.to_vec();
+        let rsa_cert_pem = rsa.pem().into_bytes();
+        assert_ca_loads(
+            tmp.path(),
+            "pkcs1-pem",
+            &rsa_cert_pem,
+            &private_key_pem("RSA PRIVATE KEY", rsa_pkcs1.clone()),
+        )?;
+        assert_ca_loads(tmp.path(), "pkcs1-der", rsa.der().as_ref(), &rsa_pkcs1)?;
+
+        let ed25519 = CertifiedIssuer::self_signed(
+            ca_params("Ed25519 Test CA", BasicConstraints::Unconstrained)?,
+            KeyPair::generate_for(&rcgen::PKCS_ED25519)?,
+        )?;
+        let ed25519_pkcs8 = ed25519.key().serialize_der();
+        let ed25519_cert_pem = ed25519.pem().into_bytes();
+        assert_ca_loads(
+            tmp.path(),
+            "ed25519-pem",
+            &ed25519_cert_pem,
+            &private_key_pem("PRIVATE KEY", ed25519_pkcs8.clone()),
+        )?;
+        assert_ca_loads(
+            tmp.path(),
+            "ed25519-der",
+            ed25519.der().as_ref(),
+            &ed25519_pkcs8,
+        )?;
+
+        let unsupported_cert = tmp.path().join("unsupported-cert.pem");
+        fs::write(
+            &unsupported_cert,
+            pem::encode(&pem::Pem::new(
+                "TRUSTED CERTIFICATE",
+                ec.der().as_ref().to_vec(),
+            )),
+        )?;
+        let error = load_certificate_chain(&unsupported_cert)
+            .err()
+            .context("expected unsupported certificate PEM label to be rejected")?;
+        assert!(
+            format!("{error:#}").contains("contains no CERTIFICATE section"),
+            "{error:#}"
+        );
+
+        let encrypted_key = tmp.path().join("encrypted-key.pem");
+        fs::write(
+            &encrypted_key,
+            pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", vec![0x30, 0x00])),
+        )?;
+        let error = load_private_key(&encrypted_key)
+            .err()
+            .context("expected encrypted private key to be rejected")?;
+        assert!(
+            format!("{error:#}")
+                .contains("expected an unencrypted PKCS#8, PKCS#1 RSA, or SEC1 EC key"),
+            "{error:#}"
+        );
         Ok(())
     }
 
