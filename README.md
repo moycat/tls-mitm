@@ -65,14 +65,12 @@ Add one or more `[[route]]` entries:
 ```toml
 [[route]]
 domain = "api.example.com"
-upstream = "tls://192.0.2.20"
-upstream_port = 9443
+upstream = "tls://192.0.2.20:9443"
 verify_name = "backend.example.com"
 
 [[route]]
 domain = "*.example.net"
-upstream = "tcp://127.0.0.1"
-upstream_port = 8080
+upstream = "tcp://127.0.0.1:8080"
 
 [[route]]
 domain = "lab.example.org"
@@ -80,9 +78,9 @@ upstream = "tls://192.0.2.30:443"
 verify = false
 ```
 
-`tls://` may be omitted. A TLS route verifies its upstream certificate against the requested SNI by default; `verify_name` selects a different certificate name. `verify = false` disables upstream certificate verification for that TLS route only and cannot be combined with `verify_name`. `tcp://` sends decrypted bytes to a plain TCP upstream and does not accept TLS verification settings.
+Every route upstream must include its protocol, host, and nonzero port in the form `tls://host:port` or `tcp://host:port`. Enclose IPv6 addresses in brackets, for example `tls://[2001:db8::1]:443`. A TLS route verifies its upstream certificate against the requested SNI by default; `verify_name` selects a different certificate name. `verify = false` disables upstream certificate verification for that TLS route only and cannot be combined with `verify_name`. `tcp://` sends decrypted bytes to a plain TCP upstream and does not accept TLS verification settings.
 
-Specify an upstream port either after the host in `upstream` or as `route.upstream_port`; specifying both is an error. If neither is set, the route uses `proxy.upstream_port`, or the listener's port if that is also unset. A route domain such as `api.example.com` matches that name exactly; `*.example.net` matches subdomains at any depth but not the apex name. Set `route.domain = "*"` for a catch-all fallback. Exact routes take precedence over suffix wildcards, which take precedence over `"*"`. Route matching is case-insensitive, and partial-label wildcards such as `api*.example.com` are invalid. If a client omits SNI, set `proxy.default_host = "example.com"` to give it an explicit default hostname. `proxy.default_host` and `route.verify_name` must be concrete DNS names, not wildcard patterns.
+Route domains follow the same rules as `dns.domains`: `api.example.com` matches that name and its subdomains, while `*.example.net` matches subdomains at any depth but not the apex name. Set `route.domain = "*"` for a catch-all fallback. When multiple routes match, the route with the most specific domain wins; a wildcard for the same base takes precedence over the inclusive plain-domain rule for subdomains. Route matching is case-insensitive, and partial-label wildcards such as `api*.example.com` are invalid. If a client omits SNI, set `proxy.default_host = "example.com"` to give it an explicit default hostname. `proxy.default_host` and `route.verify_name` must be concrete DNS names, not wildcard patterns.
 
 ### Provide DNS to a test device
 
