@@ -4,7 +4,7 @@
 
 ## Build and configure
 
-Building requires Rust. Certificate signing and the certificate tests require the `openssl` command on Linux or macOS. The supplied CA private key must be an unencrypted PEM file. `proxy.ca_cert` may be a PEM certificate chain: its first certificate must be the issuing CA that matches `proxy.ca_key`, followed by its issuers in signing order. The proxy sends this chain with each generated leaf certificate. It does not perform an additional OpenSSL chain-verification step after signing; the test device must trust the corresponding root CA or an intermediate CA explicitly installed as a trust anchor. The included CA and key are test fixtures only. Never distribute the CA private key to test devices.
+Building requires Rust. The supplied CA private key must be an unencrypted PKCS#8 PEM file. `proxy.ca_cert` may be a PEM certificate chain: its first certificate must be the issuing CA that matches `proxy.ca_key`, followed by its issuers in signing order. The proxy sends this chain with each generated leaf certificate. It does not perform an additional chain-verification step after signing; the test device must trust the corresponding root CA or an intermediate CA explicitly installed as a trust anchor. Generated leaf certificates have a 160-hour validity period whose start is randomized between 24 and 48 hours before issuance. The included CA and key are test fixtures only. Never distribute the CA private key to test devices.
 
 ```sh
 cargo build --release

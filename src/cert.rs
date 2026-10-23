@@ -1,24 +1,69 @@
 pub use crate::domain::normalize_dns_name;
 use anyhow::{anyhow, bail, Context, Result};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, PublicKeyData,
+};
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
+use x509_parser::parse_x509_certificate;
 
-const LEAF_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+const DAY_SECONDS: u64 = 24 * 60 * 60;
+const LEAF_VALIDITY: Duration = Duration::from_secs(160 * 60 * 60);
+const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(DAY_SECONDS);
 const CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub struct LeafCredentials {
     pub certs: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
+}
+
+struct IssuedLeaf {
+    credentials: LeafCredentials,
+    expires_at: SystemTime,
+}
+
+#[derive(Clone, Copy)]
+struct LeafValidity {
+    not_before: SystemTime,
+    not_after: SystemTime,
+}
+
+impl LeafValidity {
+    fn random(now: SystemTime) -> Result<Self> {
+        let now = now
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs();
+        let mut random = [0u8; 8];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| anyhow!("generate certificate validity offset"))?;
+        let not_before = UNIX_EPOCH
+            + Duration::from_secs(
+                now.checked_sub(backdate_seconds(u64::from_le_bytes(random)))
+                    .context("system clock is too close to the Unix epoch")?,
+            );
+        let not_after = not_before
+            .checked_add(LEAF_VALIDITY)
+            .context("certificate validity exceeds the system time range")?;
+        Ok(Self {
+            not_before,
+            not_after,
+        })
+    }
+}
+
+fn backdate_seconds(random: u64) -> u64 {
+    DAY_SECONDS + random % (DAY_SECONDS + 1)
 }
 
 struct CachedLeaf {
@@ -44,8 +89,7 @@ impl LeafCache {
 
 #[derive(Clone)]
 pub struct CertificateAuthority {
-    cert_path: PathBuf,
-    key_path: PathBuf,
+    issuer: Arc<Issuer<'static, KeyPair>>,
     cert_chain: Vec<CertificateDer<'static>>,
     cache: Arc<Mutex<LeafCache>>,
 }
@@ -61,38 +105,37 @@ impl CertificateAuthority {
         if cert_chain.is_empty() {
             bail!("CA certificate bundle contains no certificates");
         }
-        let _ = PrivateKeyDer::from_pem_file(&key_path).context("parse CA private key")?;
-        let date_check = Command::new("openssl")
-            .arg("x509")
-            .arg("-in")
-            .arg(&cert_path)
-            .args(["-checkend", "0", "-noout"])
-            .output()
-            .context("OpenSSL is required to sign leaf certificates")?;
-        if !date_check.status.success() {
-            bail!("CA certificate has expired or OpenSSL could not read it");
+        let private_key =
+            PrivateKeyDer::from_pem_file(&key_path).context("parse CA private key")?;
+        let key_pair = KeyPair::try_from(&private_key)
+            .context("parse CA private key as unencrypted PKCS#8 PEM")?;
+        {
+            let (remainder, parsed) = parse_x509_certificate(cert_chain[0].as_ref())
+                .map_err(|error| anyhow!("parse CA certificate: {error}"))?;
+            if !remainder.is_empty() {
+                bail!("CA certificate contains trailing data");
+            }
+            if !parsed.validity().is_valid() {
+                bail!("CA certificate is not currently valid");
+            }
+            if !parsed.is_ca() {
+                bail!("CA certificate is not authorized to sign certificates");
+            }
+            if parsed
+                .key_usage()
+                .map_err(|error| anyhow!("read CA key usage: {error}"))?
+                .is_some_and(|usage| !usage.value.key_cert_sign())
+            {
+                bail!("CA certificate key usage does not permit certificate signing");
+            }
+            if parsed.public_key().raw != key_pair.subject_public_key_info().as_slice() {
+                bail!("CA certificate and private key do not match");
+            }
         }
-        let cert_public = Command::new("openssl")
-            .args(["x509", "-in"])
-            .arg(&cert_path)
-            .args(["-pubkey", "-noout"])
-            .output()
-            .context("read CA certificate public key")?;
-        let key_public = Command::new("openssl")
-            .args(["pkey", "-in"])
-            .arg(&key_path)
-            .arg("-pubout")
-            .output()
-            .context("read CA private-key public component")?;
-        if !cert_public.status.success() || !key_public.status.success() {
-            bail!("could not validate CA certificate and private key");
-        }
-        if cert_public.stdout != key_public.stdout {
-            bail!("CA certificate and private key do not match");
-        }
+        let issuer: Issuer<'static, KeyPair> = Issuer::from_ca_cert_der(&cert_chain[0], key_pair)
+            .context("load CA certificate for signing")?;
         Ok(Self {
-            cert_path,
-            key_path,
+            issuer: Arc::new(issuer),
             cert_chain,
             cache: Arc::new(Mutex::new(LeafCache::default())),
         })
@@ -115,9 +158,6 @@ impl CertificateAuthority {
             .filter(|entry| now < entry.expires_at)
             .map(|entry| entry.credentials.clone());
 
-        // OpenSSL signs a leaf for seven days. Start the clock before it runs so
-        // these deadlines are conservative even if signing takes some time.
-        let signing_started = SystemTime::now();
         let ca = self.clone();
         let name = host.clone();
         let issued = tokio::task::spawn_blocking(move || ca.issue_leaf(&name))
@@ -141,8 +181,8 @@ impl CertificateAuthority {
             }
         };
         debug!(%host, "issued leaf certificate");
-        let leaf = Arc::new(leaf);
-        let expires_at = signing_started + LEAF_VALIDITY;
+        let expires_at = leaf.expires_at;
+        let leaf = Arc::new(leaf.credentials);
         cache.entries.insert(
             host,
             CachedLeaf {
@@ -154,99 +194,56 @@ impl CertificateAuthority {
         Ok(leaf)
     }
 
-    fn issue_leaf(&self, host: &str) -> Result<LeafCredentials> {
-        let tmp = tempfile::tempdir().context("create temporary certificate directory")?;
-        let key = tmp.path().join("leaf.key.pem");
-        let csr = tmp.path().join("leaf.csr.pem");
-        let cert = tmp.path().join("leaf.crt.pem");
-        let ext = tmp.path().join("leaf.ext");
-
-        fs::write(
-            &ext,
-            format!(
-                "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:{host}\n"
-            ),
-        )?;
-
+    fn issue_leaf(&self, host: &str) -> Result<IssuedLeaf> {
+        let validity = LeafValidity::random(SystemTime::now())?;
         let common_name = if host.len() <= 64 { host } else { "mitm.local" };
-        run_openssl(
-            Command::new("openssl")
-                .args([
-                    "ecparam",
-                    "-name",
-                    "prime256v1",
-                    "-genkey",
-                    "-noout",
-                    "-out",
-                ])
-                .arg(&key),
-            "generate leaf key",
-        )?;
-        run_openssl(
-            Command::new("openssl")
-                .args(["req", "-new", "-key"])
-                .arg(&key)
-                .arg("-out")
-                .arg(&csr)
-                .arg("-subj")
-                .arg(format!("/CN={common_name}")),
-            "create leaf CSR",
-        )?;
-
         let mut serial = [0u8; 16];
         SystemRandom::new()
             .fill(&mut serial)
             .map_err(|_| anyhow!("generate certificate serial"))?;
         serial[0] &= 0x7f;
-        let serial_hex: String = serial.iter().map(|v| format!("{v:02x}")).collect();
-        run_openssl(
-            Command::new("openssl")
-                .args(["x509", "-req", "-in"])
-                .arg(&csr)
-                .arg("-CA")
-                .arg(&self.cert_path)
-                .arg("-CAkey")
-                .arg(&self.key_path)
-                .args([
-                    "-set_serial",
-                    &format!("0x{serial_hex}"),
-                    "-days",
-                    "7",
-                    "-sha256",
-                    "-extfile",
-                ])
-                .arg(&ext)
-                .arg("-out")
-                .arg(&cert),
-            "sign leaf certificate",
-        )?;
-        let mut certs = vec![CertificateDer::from_pem_file(&cert).context("parse signed leaf")?];
-        certs.extend(self.cert_chain.iter().cloned());
-        let key = PrivateKeyDer::from_pem_file(&key).context("parse generated leaf key")?;
-        Ok(LeafCredentials { certs, key })
-    }
-}
+        if serial.iter().all(|byte| *byte == 0) {
+            serial[15] = 1;
+        }
 
-fn run_openssl(cmd: &mut Command, step: &str) -> Result<()> {
-    let output = cmd.output().with_context(|| format!("OpenSSL: {step}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("OpenSSL could not {step}: {}", stderr.trim());
+        let mut params = CertificateParams::new(vec![host.to_owned()])
+            .context("create leaf certificate parameters")?;
+        params.not_before = validity.not_before.into();
+        params.not_after = validity.not_after.into();
+        params.serial_number = Some(serial.to_vec().into());
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let mut distinguished_name = DistinguishedName::new();
+        distinguished_name.push(DnType::CommonName, common_name);
+        params.distinguished_name = distinguished_name;
+
+        let key = KeyPair::generate().context("generate leaf key")?;
+        let certificate = params
+            .signed_by(&key, self.issuer.as_ref())
+            .context("sign leaf certificate")?;
+        let mut certs = vec![certificate.der().clone()];
+        certs.extend(self.cert_chain.iter().cloned());
+        let key: PrivateKeyDer<'static> = key.into();
+        Ok(IssuedLeaf {
+            credentials: LeafCredentials { certs, key },
+            expires_at: validity.not_after,
+        })
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::future::join_all;
+    use rcgen::{BasicConstraints, CertifiedIssuer};
     use rustls::client::danger::ServerCertVerifier;
     use rustls::client::WebPkiServerVerifier;
     use rustls::pki_types::{ServerName, UnixTime};
     use rustls::RootCertStore;
 
     #[test]
-    fn validates_dns_names_before_open_ssl() {
+    fn validates_dns_names_before_signing() {
         assert_eq!(normalize_dns_name("Example.COM.").unwrap(), "example.com");
         for invalid in ["", ".example", "a..b", "-bad.com", "a/b", "a\nB", "*.x"] {
             assert!(normalize_dns_name(invalid).is_err(), "{invalid}");
@@ -256,6 +253,50 @@ mod tests {
     fn test_ca() -> Result<CertificateAuthority> {
         let certs = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/certs");
         CertificateAuthority::new(&certs.join("test.crt.pem"), &certs.join("test.key.pem"))
+    }
+
+    fn ca_params(common_name: &str, constraints: BasicConstraints) -> Result<CertificateParams> {
+        let now = SystemTime::now();
+        let mut params = CertificateParams::new(Vec::<String>::new())?;
+        params.not_before = (now - Duration::from_secs(DAY_SECONDS)).into();
+        params.not_after = (now + Duration::from_secs(365 * DAY_SECONDS)).into();
+        params.is_ca = IsCa::Ca(constraints);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let mut distinguished_name = DistinguishedName::new();
+        distinguished_name.push(DnType::CommonName, common_name);
+        params.distinguished_name = distinguished_name;
+        Ok(params)
+    }
+
+    #[test]
+    fn random_backdate_covers_the_inclusive_one_to_two_day_range() {
+        assert_eq!(backdate_seconds(0), DAY_SECONDS);
+        assert_eq!(backdate_seconds(DAY_SECONDS), 2 * DAY_SECONDS);
+        assert_eq!(backdate_seconds(DAY_SECONDS + 1), DAY_SECONDS);
+        for random in [1, DAY_SECONDS - 1, u32::MAX as u64, u64::MAX] {
+            assert!((DAY_SECONDS..=2 * DAY_SECONDS).contains(&backdate_seconds(random)));
+        }
+    }
+
+    #[test]
+    fn leaf_is_valid_for_160_hours_and_backdated_one_to_two_days() -> Result<()> {
+        let ca = test_ca()?;
+        let before = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let leaf = ca.issue_leaf("validity.example")?;
+        let after = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let (_, parsed) = parse_x509_certificate(leaf.credentials.certs[0].as_ref())
+            .map_err(|error| anyhow!("parse issued certificate: {error}"))?;
+        let not_before = parsed.validity().not_before.timestamp();
+        let not_after = parsed.validity().not_after.timestamp();
+
+        assert!(not_before >= before - 2 * DAY_SECONDS as i64 - 1);
+        assert!(not_before <= after - DAY_SECONDS as i64 + 1);
+        assert_eq!(not_after - not_before, LEAF_VALIDITY.as_secs() as i64);
+        assert_eq!(
+            leaf.expires_at.duration_since(UNIX_EPOCH)?.as_secs() as i64,
+            not_after
+        );
+        Ok(())
     }
 
     #[test]
@@ -280,6 +321,12 @@ mod tests {
                 assert_eq!(
                     entry.expires_at.duration_since(entry.renew_at)?,
                     RENEW_BEFORE_EXPIRY
+                );
+                let (_, parsed) = parse_x509_certificate(first.certs[0].as_ref())
+                    .map_err(|error| anyhow!("parse cached certificate: {error}"))?;
+                assert_eq!(
+                    entry.expires_at.duration_since(UNIX_EPOCH)?.as_secs() as i64,
+                    parsed.validity().not_after.timestamp()
                 );
                 // Simulate a leaf with less than 24 hours remaining.
                 entry.renew_at = now - Duration::from_secs(1);
@@ -354,87 +401,29 @@ mod tests {
     fn intermediate_ca_issues_leaf_and_supplies_full_pem_chain() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let root_key = tmp.path().join("root.key.pem");
-        let root_csr = tmp.path().join("root.csr.pem");
         let root_cert = tmp.path().join("root.crt.pem");
-        let root_ext = tmp.path().join("root.ext");
         let issuer_key = tmp.path().join("issuer.key.pem");
-        let issuer_csr = tmp.path().join("issuer.csr.pem");
         let issuer_cert = tmp.path().join("issuer.crt.pem");
-        let issuer_ext = tmp.path().join("issuer.ext");
         let bundle = tmp.path().join("bundle.crt.pem");
 
-        fs::write(
-            &root_ext,
-            "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n",
+        let root = CertifiedIssuer::self_signed(
+            ca_params("Local Test Root", BasicConstraints::Unconstrained)?,
+            KeyPair::generate()?,
         )?;
-        fs::write(
-            &issuer_ext,
-            "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
+        let issuer = CertifiedIssuer::signed_by(
+            ca_params("Local Test Intermediate", BasicConstraints::Constrained(0))?,
+            KeyPair::generate()?,
+            &root,
         )?;
-        for key in [&root_key, &issuer_key] {
-            run_openssl(
-                Command::new("openssl")
-                    .args([
-                        "ecparam",
-                        "-name",
-                        "prime256v1",
-                        "-genkey",
-                        "-noout",
-                        "-out",
-                    ])
-                    .arg(key),
-                "generate test CA key",
-            )?;
-        }
-        run_openssl(
-            Command::new("openssl")
-                .args(["req", "-new", "-key"])
-                .arg(&root_key)
-                .arg("-out")
-                .arg(&root_csr)
-                .args(["-subj", "/CN=Local Test Root"]),
-            "create test root CSR",
-        )?;
-        run_openssl(
-            Command::new("openssl")
-                .args(["x509", "-req", "-in"])
-                .arg(&root_csr)
-                .arg("-signkey")
-                .arg(&root_key)
-                .args(["-set_serial", "1", "-days", "7", "-sha256", "-extfile"])
-                .arg(&root_ext)
-                .arg("-out")
-                .arg(&root_cert),
-            "sign test root certificate",
-        )?;
-        run_openssl(
-            Command::new("openssl")
-                .args(["req", "-new", "-key"])
-                .arg(&issuer_key)
-                .arg("-out")
-                .arg(&issuer_csr)
-                .args(["-subj", "/CN=Local Test Intermediate"]),
-            "create test intermediate CSR",
-        )?;
-        run_openssl(
-            Command::new("openssl")
-                .args(["x509", "-req", "-in"])
-                .arg(&issuer_csr)
-                .arg("-CA")
-                .arg(&root_cert)
-                .arg("-CAkey")
-                .arg(&root_key)
-                .args(["-set_serial", "2", "-days", "7", "-sha256", "-extfile"])
-                .arg(&issuer_ext)
-                .arg("-out")
-                .arg(&issuer_cert),
-            "sign test intermediate certificate",
-        )?;
+        fs::write(&root_key, root.key().serialize_pem())?;
+        fs::write(&root_cert, root.pem())?;
+        fs::write(&issuer_key, issuer.key().serialize_pem())?;
+        fs::write(&issuer_cert, issuer.pem())?;
 
         // A missing root does not prevent an intermediate CA from signing a leaf.
         let partial = CertificateAuthority::new(&issuer_cert, &issuer_key)?;
         let partial_leaf = partial.issue_leaf("device.example")?;
-        assert_eq!(partial_leaf.certs.len(), 2);
+        assert_eq!(partial_leaf.credentials.certs.len(), 2);
 
         let mut bundle_pem = fs::read(&issuer_cert)?;
         bundle_pem.extend_from_slice(&fs::read(&root_cert)?);
@@ -445,9 +434,9 @@ mod tests {
         let leaf = ca.issue_leaf("device.example")?;
         let issuer_der = CertificateDer::from_pem_file(&issuer_cert)?;
         let root_der = CertificateDer::from_pem_file(&root_cert)?;
-        assert_eq!(leaf.certs.len(), 3);
-        assert_eq!(leaf.certs[1], issuer_der);
-        assert_eq!(leaf.certs[2], root_der);
+        assert_eq!(leaf.credentials.certs.len(), 3);
+        assert_eq!(leaf.credentials.certs[1], issuer_der);
+        assert_eq!(leaf.credentials.certs[2], root_der);
 
         // A client that trusts the root must be able to validate the returned chain.
         let mut roots = RootCertStore::empty();
@@ -455,12 +444,75 @@ mod tests {
         WebPkiServerVerifier::builder(Arc::new(roots))
             .build()?
             .verify_server_cert(
-                &leaf.certs[0],
-                &leaf.certs[1..],
+                &leaf.credentials.certs[0],
+                &leaf.credentials.certs[1..],
                 &ServerName::try_from("device.example")?,
                 &[],
                 UnixTime::now(),
             )?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_expired_ca_without_external_tools() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cert = tmp.path().join("expired.crt.pem");
+        let key = tmp.path().join("expired.key.pem");
+        let now = SystemTime::now();
+        let signing_key = KeyPair::generate()?;
+        let mut params = ca_params("Expired Test CA", BasicConstraints::Unconstrained)?;
+        params.not_before = (now - Duration::from_secs(2 * DAY_SECONDS)).into();
+        params.not_after = (now - Duration::from_secs(DAY_SECONDS)).into();
+        let expired = CertifiedIssuer::self_signed(params, signing_key)?;
+        fs::write(&cert, expired.pem())?;
+        fs::write(&key, expired.key().serialize_pem())?;
+
+        let error = CertificateAuthority::new(&cert, &key)
+            .err()
+            .context("expected expired CA to be rejected")?;
+        assert!(
+            format!("{error:#}").contains("CA certificate is not currently valid"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_certificates_that_cannot_sign() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let now = SystemTime::now();
+
+        for (name, is_ca, key_usages, expected) in [
+            (
+                "leaf",
+                IsCa::ExplicitNoCa,
+                vec![KeyUsagePurpose::DigitalSignature],
+                "is not authorized to sign certificates",
+            ),
+            (
+                "wrong-usage",
+                IsCa::Ca(BasicConstraints::Unconstrained),
+                vec![KeyUsagePurpose::DigitalSignature],
+                "key usage does not permit certificate signing",
+            ),
+        ] {
+            let cert_path = tmp.path().join(format!("{name}.crt.pem"));
+            let key_path = tmp.path().join(format!("{name}.key.pem"));
+            let signing_key = KeyPair::generate()?;
+            let mut params = CertificateParams::new(Vec::<String>::new())?;
+            params.not_before = (now - Duration::from_secs(DAY_SECONDS)).into();
+            params.not_after = (now + Duration::from_secs(DAY_SECONDS)).into();
+            params.is_ca = is_ca;
+            params.key_usages = key_usages;
+            let certificate = params.self_signed(&signing_key)?;
+            fs::write(&cert_path, certificate.pem())?;
+            fs::write(&key_path, signing_key.serialize_pem())?;
+
+            let error = CertificateAuthority::new(&cert_path, &key_path)
+                .err()
+                .with_context(|| format!("expected {name} certificate to be rejected"))?;
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
         Ok(())
     }
 }
